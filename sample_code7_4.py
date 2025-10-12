@@ -5,6 +5,7 @@
 # RETURNS:
 # - At least ONE ROW PER RECEIPT (matched or not). Unmatched receipts emit a row with grouping_type = "unmatched".
 # - ALL receipt columns prefixed r_* and ALL invoice columns prefixed i_*.
+# - Adds group_count = number of invoices connected to that receipt (0 if unmatched).
 
 from __future__ import annotations
 import os, json, time, math, uuid, threading
@@ -644,7 +645,6 @@ class GlobalMinCostReconciler:
             if amt_c > 0:
                 receipts_caps.append({"rid": rid, "amount_cents": amt_c, "raw": r})
             else:
-                # still add zero-amount receipts so they appear as unmatched row later
                 receipts_caps.append({"rid": rid, "amount_cents": 0, "raw": r})
 
         invoices_caps: Dict[str, Dict[str, Any]] = {}
@@ -681,7 +681,7 @@ class GlobalMinCostReconciler:
         flows = self._solve_flow(receipts_caps, invoices_caps, edges_scored)
 
         # 6) Degree maps for grouping
-        rec_degree = defaultdict(int)
+        rec_degree = defaultdict(int)   # number of invoices per receipt
         inv_degree = defaultdict(int)
         rid_to_flows: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
         for rid, inv_key, flow_cents in flows:
@@ -716,6 +716,7 @@ class GlobalMinCostReconciler:
             T.StructField("edge_cost", T.IntegerType(), True),
 
             T.StructField("grouping_type (r-to_i)", T.StringType(), True),
+            T.StructField("group_count", T.IntegerType(), True),   # <-- NEW
             T.StructField("receipt_id", T.StringType(), True),
             T.StructField("invoice_key", T.StringType(), True),
         ]
@@ -730,6 +731,7 @@ class GlobalMinCostReconciler:
         # 7a) Emit matched rows (flow > 0)
         for rid, pairs in rid_to_flows.items():
             rc = next(x["raw"] for x in receipts_caps if x["rid"] == rid)
+            r_group_count = rec_degree.get(rid, 0)  # number of invoices this receipt matched to
             for inv_key, flow_cents in pairs:
                 ic = invoices_caps[inv_key]["raw"]
                 feats = results_scores.get((rid, inv_key), None)
@@ -753,6 +755,7 @@ class GlobalMinCostReconciler:
                     "edge_cost": int(edge_cost),
 
                     "grouping_type (r-to_i)": grouping_for(rid, inv_key),
+                    "group_count": int(r_group_count),   # <-- NEW
                     "receipt_id": _s(rc.get("receipt_id")),
                     "invoice_key": inv_key,
                 }
@@ -768,7 +771,6 @@ class GlobalMinCostReconciler:
                 continue
             rc = rcap["raw"]
             unit_cur = _s(rc.get("currcode")) or "USD"
-            # decide explanation
             had_cands = receipt_had_candidates.get(rid, False)
             expl = ("No allocation from solver (capacity/optimization or low confidence)."
                     if had_cands else
@@ -784,9 +786,10 @@ class GlobalMinCostReconciler:
                 "llm_explanation": expl,
                 "edge_cost": 0,
 
-                "grouping_type (r-to_i)": grouping_for(rid, None),
+                "grouping_type (r-to_i)": "unmatched",
+                "group_count": 0,                      # <-- NEW
                 "receipt_id": _s(rc.get("receipt_id")),
-                "invoice_key": "",  # no invoice
+                "invoice_key": "",
             }
             for c in r_cols: data[f"r_{c}"] = "" if rc.get(c) is None else str(rc.get(c))
             for c in i_cols: data[f"i_{c}"] = ""  # empty for unmatched
