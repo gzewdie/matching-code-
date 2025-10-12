@@ -1,9 +1,7 @@
 # receipt_invoice_min_cost_flow.py
 # Global reconciliation via min-cost flow with UNMATCHED sink (feasible even when some receipts lack candidates).
-# - Embeds INVOICE lines once -> FAISS
-# - For each RECEIPT line: FAISS retrieve -> single GPT-4.1 call to score candidate edges
-# - Build min-cost flow (capacities in cents), add UNMATCHED sink so the model is always solvable.
-# - Works with OR-Tools (preferred) or NetworkX fallback.
+# Embeds INVOICE lines -> FAISS; per RECEIPT: FAISS retrieve + single GPT-4.1 call scoring edges;
+# Solves min-cost flow (NetworkX by default; OR-Tools only if classic API is available).
 
 from __future__ import annotations
 import os, json, time, math, uuid, threading
@@ -20,19 +18,25 @@ from openai import AzureOpenAI
 
 from pyspark.sql import DataFrame, types as T
 
-# --------- Robust solver imports ---------
+# --------- Robust solver imports + capability probe ---------
 _HAS_ORTOOLS = False
 try:
-    # Classic path
-    from ortools.graph import pywrapgraph  # type: ignore
-    _HAS_ORTOOLS = True
-except Exception:
+    # Try both import paths
     try:
-        # Alt path in newer wheels
-        from ortools.graph.python import min_cost_flow as pywrapgraph  # type: ignore
-        _HAS_ORTOOLS = True
+        from ortools.graph import pywrapgraph  # type: ignore
+        _ortools_candidate = "classic"
     except Exception:
-        _HAS_ORTOOLS = False
+        from ortools.graph.python import min_cost_flow as pywrapgraph  # type: ignore
+        _ortools_candidate = "python"
+
+    # Probe for classic API methods; if missing, we will NOT use OR-Tools.
+    _probe = pywrapgraph.SimpleMinCostFlow()
+    _HAS_ORTOOLS = all(
+        hasattr(_probe, name)
+        for name in ("AddArcWithCapacityAndUnitCost", "SetNodeSupply", "NumArcs", "Tail", "Head", "Flow")
+    )
+except Exception:
+    _HAS_ORTOOLS = False
 
 try:
     import networkx as nx
@@ -85,10 +89,9 @@ class FlowConfig:
     w_amount_closeness: float = 0.07
     w_date_proximity: float = 0.03
     cost_scale: int = 1000
-    # NEW: unmatched sink always-on to guarantee feasibility
     use_unmatched_sink: bool = True
-    unmatched_unit_cost: int = 10_000  # cost per cent (high penalty)
-    debug_metrics: bool = False         # print candidate coverage before solve
+    unmatched_unit_cost: int = 10_000  # cost per cent (high penalty to discourage unmatched)
+    debug_metrics: bool = False
 
 
 # ============================ Azure client ============================
@@ -278,11 +281,10 @@ class LLMEdgeScorer:
 
 class GlobalMinCostReconciler:
     """
-    Build a global bipartite min-cost flow:
-      S -> R (capacity = receipt cents)
-      R -> I (capacity ≤ min(receipt, invoice), cost from LLM/cosine/features)
-      I -> T (capacity = invoice cents)
-      [Optional] R -> U -> T (UNMATCHED sink with high penalty cost, guarantees feasibility)
+    S -> R (cap=receipt cents)
+    R -> I (cap ≤ min(receipt, invoice), cost from LLM/cosine/features)
+    I -> T (cap=invoice cents)
+    Optional unmatched: R -> U -> T at high cost (guarantees feasibility).
     """
 
     def __init__(self, spark,
@@ -444,14 +446,11 @@ class GlobalMinCostReconciler:
         score = max(0.0, min(1.0, score))
         return int(round(self.flow_cfg.cost_scale * (1.0 - score)))
 
-    # ---------- Solver ----------
+    # ---------- Solver (OR-Tools classic only; else NetworkX) ----------
     def _solve_flow(self,
                     receipts: List[Dict[str, Any]],
                     invoices: Dict[str, Dict[str, Any]],
                     edges_scored: Dict[Tuple[str, str], Dict[str, Any]]) -> List[Tuple[str, str, int]]:
-        """
-        Returns list of (rid, invoice_key, flow_cents) for flows > 0
-        """
         if self.flow_cfg.debug_metrics:
             n_receipts = len(receipts)
             n_invoices = len(invoices)
@@ -488,7 +487,7 @@ class GlobalMinCostReconciler:
                 inode = nid(f"I:{inv_key}")
                 mcf.AddArcWithCapacityAndUnitCost(inode, T, int(inv["amount_cents"]), 0)
 
-            # R->I edges
+            # R->I
             for (rid, inv_key), info in edges_scored.items():
                 cap = max(0, int(info["cap"]))
                 if cap <= 0: continue
@@ -497,12 +496,10 @@ class GlobalMinCostReconciler:
                 inode = nid(f"I:{inv_key}")
                 mcf.AddArcWithCapacityAndUnitCost(rnode, inode, cap, cost)
 
-            # UNMATCHED sink (guarantee feasibility)
+            # UNMATCHED sink
             if self.flow_cfg.use_unmatched_sink:
                 U = nid("U")
-                # U -> T: pass through all possible receipt capacity
                 mcf.AddArcWithCapacityAndUnitCost(U, T, total_receipts, 0)
-                # R -> U at high cost
                 for r in receipts:
                     rnode = nid(f"R:{r['rid']}")
                     mcf.AddArcWithCapacityAndUnitCost(
@@ -522,16 +519,15 @@ class GlobalMinCostReconciler:
                 head = mcf.Head(i)
                 flow = mcf.Flow(i)
                 if flow <= 0: continue
+                # decode only R->I arcs
                 tail_name = [k for k, v in node_id.items() if v == tail][0]
                 head_name = [k for k, v in node_id.items() if v == head][0]
                 if tail_name.startswith("R:") and head_name.startswith("I:"):
                     rid = tail_name[2:]
                     inv_key = head_name[2:]
                     flows.append((rid, inv_key, int(flow)))
-                # We ignore R->U flows in the result rows; you can expose them if you want unmatched reporting.
             return flows
 
-        # ---- NetworkX fallback ----
         elif _HAS_NETWORKX:
             G = nx.DiGraph()
             G.add_node("S", demand=-int(total_send))
@@ -737,8 +733,7 @@ class GlobalMinCostReconciler:
             rc = r_map[rid]["raw"]
             ic = inv_map[inv_key]["raw"]
             feats = results_scores.get((rid, inv_key), None)
-            if feats is None: 
-                # Edge existed in flow but not in scored dict (shouldn't happen); skip defensively
+            if feats is None:
                 continue
             r_amt_f = _to_float(rc.get("amount"))
             edge_cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt_f, feats["days_delta"])
@@ -805,3 +800,4 @@ if __name__ == "__main__":
     # result_df = reconciler.run(df_invoices_line_level, df_receipts_line_level)
     # display(result_df)
     pass
+
