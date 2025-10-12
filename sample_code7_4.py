@@ -2,7 +2,9 @@
 # Global reconciliation via min-cost flow with UNMATCHED sink (feasible even when some receipts lack candidates).
 # Embeds INVOICE lines -> FAISS; per RECEIPT: FAISS retrieve + single GPT-4.1 call scoring edges;
 # Solves min-cost flow (NetworkX by default; OR-Tools only if classic API is available).
-# Returns ALL receipt columns (r_*) and ALL invoice columns (i_*) along with allocation and scoring columns.
+# RETURNS:
+# - At least ONE ROW PER RECEIPT (matched or not). Unmatched receipts emit a row with grouping_type = "unmatched".
+# - ALL receipt columns prefixed r_* and ALL invoice columns prefixed i_*.
 
 from __future__ import annotations
 import os, json, time, math, uuid, threading
@@ -305,7 +307,6 @@ class GlobalMinCostReconciler:
 
     # ---------- Build invoice index & meta + coarse buckets ----------
     def _build_invoice_index(self, df_invoices: DataFrame):
-        # Use ALL columns for meta; compose() only reads a subset.
         inv_cols = df_invoices.columns
         inv_rows = [r.asDict() for r in df_invoices.select(*inv_cols).collect()]
 
@@ -347,12 +348,10 @@ class GlobalMinCostReconciler:
         return index, meta, dim, cur_bucket, ym_bucket, amt_bucket
 
     def _allowed_invoice_keys(self, receipt: Dict[str, Any], cur_bucket, ym_bucket, amt_bucket) -> Optional[set]:
-        # For bucketing we DO NOT force default USD, to avoid over-filtering if invoices lack currency.
         cur = _s(receipt.get("currcode"))
         r_amt = _to_float(receipt.get("amount"))
         r_date = _parse_date(receipt.get("receipt_date"))
 
-        # amount band
         if math.isnan(r_amt):
             amount_keys = None
         else:
@@ -363,7 +362,6 @@ class GlobalMinCostReconciler:
                 lst = amt_bucket.get(str(v))
                 if lst: amount_keys.update(lst)
 
-        # month ±4
         month_keys = set()
         if r_date:
             for k in range(-4, 5):
@@ -517,7 +515,6 @@ class GlobalMinCostReconciler:
                 head = mcf.Head(i)
                 flow = mcf.Flow(i)
                 if flow <= 0: continue
-                # decode only R->I arcs
                 tail_name = [k for k, v in node_id.items() if v == tail][0]
                 head_name = [k for k, v in node_id.items() if v == head][0]
                 if tail_name.startswith("R:") and head_name.startswith("I:"):
@@ -597,7 +594,7 @@ class GlobalMinCostReconciler:
         # 3) Candidate edges + LLM scoring
         def score_one_receipt(i: int):
             r = receipts_rows[i]
-            rid = _s(r.get("receipt_id")) or str(i)  # ensure stable id
+            rid = _s(r.get("receipt_id")) or str(i)  # ensure stable id if missing
             q = R[i]
             allowed = self._allowed_invoice_keys(r, cur_bucket, ym_bucket, amt_bucket)
             cand = self._build_edges_for_receipt(q, r, index, meta, allowed)
@@ -621,11 +618,14 @@ class GlobalMinCostReconciler:
 
         results_scores: Dict[Tuple[str, str], Dict[str, Any]] = {}
         receipts_caps = []
+        receipt_had_candidates: Dict[str, bool] = defaultdict(bool)
 
         with ThreadPoolExecutor(max_workers=self.llm_cfg.max_workers) as ex:
             futs = {ex.submit(score_one_receipt, i): i for i in range(len(receipts_rows))}
             for fut in as_completed(futs):
                 rid, cand, scores = fut.result()
+                if cand:
+                    receipt_had_candidates[rid] = True
                 for c in cand:
                     inv_key = c["invoice_key"]
                     s = scores.get(inv_key, {"confidence": 0.0, "explanation": ""})
@@ -643,6 +643,9 @@ class GlobalMinCostReconciler:
             amt_c = _amount_to_cents(r.get("amount"), self.flow_cfg.cents_scale)
             if amt_c > 0:
                 receipts_caps.append({"rid": rid, "amount_cents": amt_c, "raw": r})
+            else:
+                # still add zero-amount receipts so they appear as unmatched row later
+                receipts_caps.append({"rid": rid, "amount_cents": 0, "raw": r})
 
         invoices_caps: Dict[str, Dict[str, Any]] = {}
         for key, inv in meta.items():
@@ -661,7 +664,6 @@ class GlobalMinCostReconciler:
             rraw = next(x["raw"] for x in receipts_caps if x["rid"] == rid)
             iraw = invoices_caps[inv_key]["raw"]
 
-            # Currency compare with defaulting (USD or borrow other side)
             rc = _s(rraw.get("currcode")) or _s(iraw.get("trancurr")) or "USD"
             ic = _s(iraw.get("trancurr")) or rc or "USD"
             if self.retr_cfg.currency_required and rc != ic:
@@ -671,21 +673,26 @@ class GlobalMinCostReconciler:
             cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt, feats["days_delta"])
             rcents = next(x["amount_cents"] for x in receipts_caps if x["rid"] == rid)
             icents = invoices_caps[inv_key]["amount_cents"]
-            cap = min(rcents, icents)
-            edges_scored[(rid, inv_key)] = {"cost": int(cost), "cap": int(cap)}
+            cap = max(0, min(rcents, icents))
+            if cap > 0:
+                edges_scored[(rid, inv_key)] = {"cost": int(cost), "cap": int(cap)}
 
         # 5) Solve
         flows = self._solve_flow(receipts_caps, invoices_caps, edges_scored)
 
-        # 6) Grouping type helpers
+        # 6) Degree maps for grouping
         rec_degree = defaultdict(int)
         inv_degree = defaultdict(int)
+        rid_to_flows: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
         for rid, inv_key, flow_cents in flows:
             if flow_cents > 0:
                 rec_degree[rid] += 1
                 inv_degree[inv_key] += 1
+                rid_to_flows[rid].append((inv_key, int(flow_cents)))
 
-        def grouping_for(rid: str, inv_key: str) -> str:
+        def grouping_for(rid: str, inv_key: Optional[str]) -> str:
+            if inv_key is None:
+                return "unmatched"
             r_deg = rec_degree.get(rid, 0)
             i_deg = inv_degree.get(inv_key, 0)
             if r_deg == 1 and i_deg == 1:
@@ -694,9 +701,9 @@ class GlobalMinCostReconciler:
                 return "one-to-many"
             if i_deg > 1:
                 return "many-to-one"
-            return "one-to-one"  # safe default if deg info missing
+            return "one-to-one"
 
-        # 7) Emit rows with ALL columns: r_* and i_*
+        # 7) Schema with ALL columns: r_* and i_*
         base_fields = [
             T.StructField("allocation_id", T.StringType(), False),
             T.StructField("allocated_amount", T.DoubleType(), True),
@@ -712,56 +719,77 @@ class GlobalMinCostReconciler:
             T.StructField("receipt_id", T.StringType(), True),
             T.StructField("invoice_key", T.StringType(), True),
         ]
-        # dynamic: make everything else StringType for portability
+        r_cols = df_receipts_line_level.columns
+        i_cols = df_invoices_line_level.columns
         r_dynamic = [T.StructField(f"r_{c}", T.StringType(), True) for c in r_cols]
-        i_dynamic = [T.StructField(f"i_{c}", T.StringType(), True) for c in df_invoices_line_level.columns]
+        i_dynamic = [T.StructField(f"i_{c}", T.StringType(), True) for c in i_cols]
         schema = T.StructType(base_fields + r_dynamic + i_dynamic)
 
-        if not flows:
-            return self.spark.createDataFrame([], schema=schema)
-
-        r_map = { (_s(r["rid"])): r for r in receipts_caps }
-        inv_map = invoices_caps
-
         rows: List[Row] = []
-        for rid, inv_key, flow_cents in flows:
-            rc = r_map[rid]["raw"]
-            ic = inv_map[inv_key]["raw"]
-            feats = results_scores.get((rid, inv_key), None)
-            if feats is None:
-                continue
-            # prefer receipt currency, then invoice, else USD
-            unit_cur = _s(rc.get("currcode")) or _s(ic.get("trancurr")) or "USD"
-            # cost recompute for audit (matches above)
-            r_amt_f = _to_float(rc.get("amount"))
-            edge_cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt_f, feats["days_delta"])
 
+        # 7a) Emit matched rows (flow > 0)
+        for rid, pairs in rid_to_flows.items():
+            rc = next(x["raw"] for x in receipts_caps if x["rid"] == rid)
+            for inv_key, flow_cents in pairs:
+                ic = invoices_caps[inv_key]["raw"]
+                feats = results_scores.get((rid, inv_key), None)
+                unit_cur = _s(rc.get("currcode")) or _s(ic.get("trancurr")) or "USD"
+                if feats:
+                    r_amt_f = _to_float(rc.get("amount"))
+                    edge_cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt_f, feats["days_delta"])
+                    llm_conf = feats["llm_conf"]; cosine = feats["cosine"]; llm_expl = feats["llm_explanation"]
+                else:
+                    edge_cost = 0; llm_conf = 0.0; cosine = 0.0; llm_expl = ""
+
+                data = {
+                    "allocation_id": str(uuid.uuid4()),
+                    "allocated_amount": float(flow_cents) / self.flow_cfg.cents_scale,
+                    "allocated_amount_cents": int(flow_cents),
+                    "unit_currency": unit_cur,
+
+                    "llm_confidence": llm_conf,
+                    "cosine_similarity": cosine,
+                    "llm_explanation": llm_expl,
+                    "edge_cost": int(edge_cost),
+
+                    "grouping_type (r-to_i)": grouping_for(rid, inv_key),
+                    "receipt_id": _s(rc.get("receipt_id")),
+                    "invoice_key": inv_key,
+                }
+                for c in r_cols: data[f"r_{c}"] = "" if rc.get(c) is None else str(rc.get(c))
+                for c in i_cols: data[f"i_{c}"] = "" if ic.get(c) is None else str(ic.get(c))
+                rows.append(Row(**data))
+
+        # 7b) Emit UNMATCHED rows for receipts with NO flows
+        matched_rids = set(rid_to_flows.keys())
+        for rcap in receipts_caps:
+            rid = _s(rcap["rid"])
+            if rid in matched_rids:
+                continue
+            rc = rcap["raw"]
+            unit_cur = _s(rc.get("currcode")) or "USD"
+            # decide explanation
+            had_cands = receipt_had_candidates.get(rid, False)
+            expl = ("No allocation from solver (capacity/optimization or low confidence)."
+                    if had_cands else
+                    "No viable candidates after retrieval/filters; routed to UNMATCHED.")
             data = {
                 "allocation_id": str(uuid.uuid4()),
-                "allocated_amount": float(flow_cents) / self.flow_cfg.cents_scale,
-                "allocated_amount_cents": int(flow_cents),
+                "allocated_amount": 0.0,
+                "allocated_amount_cents": 0,
                 "unit_currency": unit_cur,
 
-                "llm_confidence": feats["llm_conf"],
-                "cosine_similarity": feats["cosine"],
-                "llm_explanation": feats["llm_explanation"],
-                "edge_cost": int(edge_cost),
+                "llm_confidence": 0.0,
+                "cosine_similarity": 0.0,
+                "llm_explanation": expl,
+                "edge_cost": 0,
 
-                "grouping_type (r-to_i)": grouping_for(rid, inv_key),
+                "grouping_type (r-to_i)": grouping_for(rid, None),
                 "receipt_id": _s(rc.get("receipt_id")),
-                "invoice_key": inv_key,
+                "invoice_key": "",  # no invoice
             }
-
-            # attach ALL receipt cols as strings
-            for c in r_cols:
-                v = rc.get(c)
-                data[f"r_{c}"] = "" if v is None else str(v)
-
-            # attach ALL invoice cols as strings
-            for c in df_invoices_line_level.columns:
-                v = ic.get(c)
-                data[f"i_{c}"] = "" if v is None else str(v)
-
+            for c in r_cols: data[f"r_{c}"] = "" if rc.get(c) is None else str(rc.get(c))
+            for c in i_cols: data[f"i_{c}"] = ""  # empty for unmatched
             rows.append(Row(**data))
 
         return self.spark.createDataFrame(rows, schema=schema)
