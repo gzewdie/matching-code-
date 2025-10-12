@@ -2,6 +2,7 @@
 # Global reconciliation via min-cost flow with UNMATCHED sink (feasible even when some receipts lack candidates).
 # Embeds INVOICE lines -> FAISS; per RECEIPT: FAISS retrieve + single GPT-4.1 call scoring edges;
 # Solves min-cost flow (NetworkX by default; OR-Tools only if classic API is available).
+# Returns ALL receipt columns (r_*) and ALL invoice columns (i_*) along with allocation and scoring columns.
 
 from __future__ import annotations
 import os, json, time, math, uuid, threading
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from collections import defaultdict
 
 import numpy as np
 import faiss
@@ -16,12 +18,11 @@ import faiss
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AzureOpenAI
 
-from pyspark.sql import DataFrame, types as T
+from pyspark.sql import DataFrame, types as T, Row
 
 # --------- Robust solver imports + capability probe ---------
 _HAS_ORTOOLS = False
 try:
-    # Try both import paths
     try:
         from ortools.graph import pywrapgraph  # type: ignore
         _ortools_candidate = "classic"
@@ -29,7 +30,6 @@ try:
         from ortools.graph.python import min_cost_flow as pywrapgraph  # type: ignore
         _ortools_candidate = "python"
 
-    # Probe for classic API methods; if missing, we will NOT use OR-Tools.
     _probe = pywrapgraph.SimpleMinCostFlow()
     _HAS_ORTOOLS = all(
         hasattr(_probe, name)
@@ -305,12 +305,9 @@ class GlobalMinCostReconciler:
 
     # ---------- Build invoice index & meta + coarse buckets ----------
     def _build_invoice_index(self, df_invoices: DataFrame):
-        cols = [
-            "invno","invdate","duedate","amount","invamt","trancurr","custno","checknum","invponum","balance",
-            "bill_to_address","ship_to_address","customer_name"
-        ]
-        existing = [c for c in cols if c in df_invoices.columns]
-        inv_rows = [r.asDict() for r in df_invoices.select(*existing).collect()]
+        # Use ALL columns for meta; compose() only reads a subset.
+        inv_cols = df_invoices.columns
+        inv_rows = [r.asDict() for r in df_invoices.select(*inv_cols).collect()]
 
         ids, texts, meta = [], [], {}
         cur_bucket: Dict[str, List[str]] = {}
@@ -350,6 +347,7 @@ class GlobalMinCostReconciler:
         return index, meta, dim, cur_bucket, ym_bucket, amt_bucket
 
     def _allowed_invoice_keys(self, receipt: Dict[str, Any], cur_bucket, ym_bucket, amt_bucket) -> Optional[set]:
+        # For bucketing we DO NOT force default USD, to avoid over-filtering if invoices lack currency.
         cur = _s(receipt.get("currcode"))
         r_amt = _to_float(receipt.get("amount"))
         r_date = _parse_date(receipt.get("receipt_date"))
@@ -582,13 +580,9 @@ class GlobalMinCostReconciler:
         # 1) Build invoice index + buckets
         index, meta, dim, cur_bucket, ym_bucket, amt_bucket = self._build_invoice_index(df_invoices_line_level)
 
-        # 2) Collect + embed receipts
-        r_cols = [
-            "receipt_id","receipt_num","check_num","batch_id","amount","receipt_date","currcode",
-            "micr_routing","micr_acct","payercust_company","unapplied_amount","bank_name","payer_address"
-        ]
-        r_exist = [c for c in r_cols if c in df_receipts_line_level.columns]
-        receipts_rows = [r.asDict() for r in df_receipts_line_level.select(*r_exist).collect()]
+        # 2) Collect + embed receipts (ALL columns)
+        r_cols = df_receipts_line_level.columns
+        receipts_rows = [r.asDict() for r in df_receipts_line_level.select(*r_cols).collect()]
 
         def r_text(r): return compose_receipt_text(r, self.emb_cfg.max_chars)
         r_texts = [r_text(r) for r in receipts_rows]
@@ -603,7 +597,7 @@ class GlobalMinCostReconciler:
         # 3) Candidate edges + LLM scoring
         def score_one_receipt(i: int):
             r = receipts_rows[i]
-            rid = _s(r.get("receipt_id"))
+            rid = _s(r.get("receipt_id")) or str(i)  # ensure stable id
             q = R[i]
             allowed = self._allowed_invoice_keys(r, cur_bucket, ym_bucket, amt_bucket)
             cand = self._build_edges_for_receipt(q, r, index, meta, allowed)
@@ -612,7 +606,7 @@ class GlobalMinCostReconciler:
             ctx = {
                 "receipt_id": rid,
                 "amount": r.get("amount"),
-                "currency": r.get("currcode"),
+                "currency": _s(r.get("currcode")) or "USD",  # default USD if missing
                 "receipt_date": _s(r.get("receipt_date")),
                 "check_num": _s(r.get("check_num")),
                 "batch_id": _s(r.get("batch_id")),
@@ -637,15 +631,15 @@ class GlobalMinCostReconciler:
                     s = scores.get(inv_key, {"confidence": 0.0, "explanation": ""})
                     results_scores[(rid, inv_key)] = {
                         "llm_conf": float(s["confidence"]),
-                        "explanation": s.get("explanation", ""),
+                        "llm_explanation": s.get("explanation", ""),
                         "cosine": float(c["cosine"]),
                         "amount_delta": float(c["amount_delta"]),
                         "days_delta": float(c["days_delta"]),
                     }
 
         # 4) Solver inputs
-        for r in receipts_rows:
-            rid = _s(r.get("receipt_id"))
+        for i, r in enumerate(receipts_rows):
+            rid = _s(r.get("receipt_id")) or str(i)
             amt_c = _amount_to_cents(r.get("amount"), self.flow_cfg.cents_scale)
             if amt_c > 0:
                 receipts_caps.append({"rid": rid, "amount_cents": amt_c, "raw": r})
@@ -667,24 +661,43 @@ class GlobalMinCostReconciler:
             rraw = next(x["raw"] for x in receipts_caps if x["rid"] == rid)
             iraw = invoices_caps[inv_key]["raw"]
 
-            if self.retr_cfg.currency_required:
-                rc = _s(rraw.get("currcode"))
-                ic = _s(iraw.get("trancurr"))
-                if rc and ic and rc != ic:
-                    continue
+            # Currency compare with defaulting (USD or borrow other side)
+            rc = _s(rraw.get("currcode")) or _s(iraw.get("trancurr")) or "USD"
+            ic = _s(iraw.get("trancurr")) or rc or "USD"
+            if self.retr_cfg.currency_required and rc != ic:
+                continue
 
             r_amt = _to_float(rraw.get("amount"))
             cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt, feats["days_delta"])
-            rc = next(x["amount_cents"] for x in receipts_caps if x["rid"] == rid)
-            ic = invoices_caps[inv_key]["amount_cents"]
-            cap = min(rc, ic)
+            rcents = next(x["amount_cents"] for x in receipts_caps if x["rid"] == rid)
+            icents = invoices_caps[inv_key]["amount_cents"]
+            cap = min(rcents, icents)
             edges_scored[(rid, inv_key)] = {"cost": int(cost), "cap": int(cap)}
 
         # 5) Solve
         flows = self._solve_flow(receipts_caps, invoices_caps, edges_scored)
 
-        # 6) Emit rows
-        schema = T.StructType([
+        # 6) Grouping type helpers
+        rec_degree = defaultdict(int)
+        inv_degree = defaultdict(int)
+        for rid, inv_key, flow_cents in flows:
+            if flow_cents > 0:
+                rec_degree[rid] += 1
+                inv_degree[inv_key] += 1
+
+        def grouping_for(rid: str, inv_key: str) -> str:
+            r_deg = rec_degree.get(rid, 0)
+            i_deg = inv_degree.get(inv_key, 0)
+            if r_deg == 1 and i_deg == 1:
+                return "one-to-one"
+            if r_deg > 1 and i_deg == 1:
+                return "one-to-many"
+            if i_deg > 1:
+                return "many-to-one"
+            return "one-to-one"  # safe default if deg info missing
+
+        # 7) Emit rows with ALL columns: r_* and i_*
+        base_fields = [
             T.StructField("allocation_id", T.StringType(), False),
             T.StructField("allocated_amount", T.DoubleType(), True),
             T.StructField("allocated_amount_cents", T.IntegerType(), True),
@@ -692,88 +705,64 @@ class GlobalMinCostReconciler:
 
             T.StructField("llm_confidence", T.DoubleType(), True),
             T.StructField("cosine_similarity", T.DoubleType(), True),
-            T.StructField("edge_explanation", T.StringType(), True),
+            T.StructField("llm_explanation", T.StringType(), True),
             T.StructField("edge_cost", T.IntegerType(), True),
 
+            T.StructField("grouping_type (r-to_i)", T.StringType(), True),
             T.StructField("receipt_id", T.StringType(), True),
-            T.StructField("r_amount", T.StringType(), True),
-            T.StructField("r_receipt_date", T.StringType(), True),
-            T.StructField("r_currency", T.StringType(), True),
-            T.StructField("r_check_num", T.StringType(), True),
-            T.StructField("r_batch_id", T.StringType(), True),
-            T.StructField("r_micr_routing", T.StringType(), True),
-            T.StructField("r_micr_acct", T.StringType(), True),
-            T.StructField("r_payer_name", T.StringType(), True),
-            T.StructField("r_unapplied_amount", T.StringType(), True),
-            T.StructField("r_bank_name", T.StringType(), True),
-            T.StructField("r_payer_address", T.StringType(), True),
-
             T.StructField("invoice_key", T.StringType(), True),
-            T.StructField("invno", T.StringType(), True),
-            T.StructField("i_amount", T.StringType(), True),
-            T.StructField("i_invdate", T.StringType(), True),
-            T.StructField("i_duedate", T.StringType(), True),
-            T.StructField("i_currency", T.StringType(), True),
-            T.StructField("i_custno", T.StringType(), True),
-            T.StructField("i_checknum", T.StringType(), True),
-            T.StructField("i_invponum", T.StringType(), True),
-            T.StructField("i_balance", T.StringType(), True),
-            T.StructField("i_bill_to_address", T.StringType(), True),
-            T.StructField("i_customer_name", T.StringType(), True),
-        ])
+        ]
+        # dynamic: make everything else StringType for portability
+        r_dynamic = [T.StructField(f"r_{c}", T.StringType(), True) for c in r_cols]
+        i_dynamic = [T.StructField(f"i_{c}", T.StringType(), True) for c in df_invoices_line_level.columns]
+        schema = T.StructType(base_fields + r_dynamic + i_dynamic)
 
         if not flows:
             return self.spark.createDataFrame([], schema=schema)
 
-        r_map = { _s(r["rid"]): r for r in receipts_caps }
+        r_map = { (_s(r["rid"])): r for r in receipts_caps }
         inv_map = invoices_caps
 
-        rows = []
+        rows: List[Row] = []
         for rid, inv_key, flow_cents in flows:
             rc = r_map[rid]["raw"]
             ic = inv_map[inv_key]["raw"]
             feats = results_scores.get((rid, inv_key), None)
             if feats is None:
                 continue
+            # prefer receipt currency, then invoice, else USD
+            unit_cur = _s(rc.get("currcode")) or _s(ic.get("trancurr")) or "USD"
+            # cost recompute for audit (matches above)
             r_amt_f = _to_float(rc.get("amount"))
             edge_cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt_f, feats["days_delta"])
-            rows.append({
+
+            data = {
                 "allocation_id": str(uuid.uuid4()),
                 "allocated_amount": float(flow_cents) / self.flow_cfg.cents_scale,
                 "allocated_amount_cents": int(flow_cents),
-                "unit_currency": _s(rc.get("currcode")) or _s(ic.get("trancurr")),
+                "unit_currency": unit_cur,
 
                 "llm_confidence": feats["llm_conf"],
                 "cosine_similarity": feats["cosine"],
-                "edge_explanation": feats["explanation"],
+                "llm_explanation": feats["llm_explanation"],
                 "edge_cost": int(edge_cost),
 
+                "grouping_type (r-to_i)": grouping_for(rid, inv_key),
                 "receipt_id": _s(rc.get("receipt_id")),
-                "r_amount": _s(rc.get("amount")),
-                "r_receipt_date": _s(rc.get("receipt_date")),
-                "r_currency": _s(rc.get("currcode")),
-                "r_check_num": _s(rc.get("check_num")),
-                "r_batch_id": _s(rc.get("batch_id")),
-                "r_micr_routing": _s(rc.get("micr_routing")),
-                "r_micr_acct": _s(rc.get("micr_acct")),
-                "r_payer_name": _s(rc.get("payercust_company")),
-                "r_unapplied_amount": _s(rc.get("unapplied_amount")),
-                "r_bank_name": _s(rc.get("bank_name")),
-                "r_payer_address": _s(rc.get("payer_address")),
-
                 "invoice_key": inv_key,
-                "invno": _s(ic.get("invno")),
-                "i_amount": _s(ic.get("amount") if ic.get("amount") is not None else ic.get("invamt")),
-                "i_invdate": _s(ic.get("invdate")),
-                "i_duedate": _s(ic.get("duedate")),
-                "i_currency": _s(ic.get("trancurr")),
-                "i_custno": _s(ic.get("custno")),
-                "i_checknum": _s(ic.get("checknum")),
-                "i_invponum": _s(ic.get("invponum")),
-                "i_balance": _s(ic.get("balance")),
-                "i_bill_to_address": _s(ic.get("bill_to_address")),
-                "i_customer_name": _s(ic.get("customer_name")),
-            })
+            }
+
+            # attach ALL receipt cols as strings
+            for c in r_cols:
+                v = rc.get(c)
+                data[f"r_{c}"] = "" if v is None else str(v)
+
+            # attach ALL invoice cols as strings
+            for c in df_invoices_line_level.columns:
+                v = ic.get(c)
+                data[f"i_{c}"] = "" if v is None else str(v)
+
+            rows.append(Row(**data))
 
         return self.spark.createDataFrame(rows, schema=schema)
 
