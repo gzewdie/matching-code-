@@ -1,846 +1,176 @@
-# receipt_invoice_min_cost_flow.py
-# Global, capacity-constrained reconciliation using LLM-scored edges + min-cost flow.
-# - Embeds INVOICE LINES once → FAISS (cosine on normalized vectors)
-# - For each RECEIPT LINE: prefilter → FAISS retrieve → one GPT-4.1 call to score each candidate edge
-# - Builds a min-cost flow with capacities equal to amounts (in cents)
-# - Solves (OR-Tools if available, else NetworkX) to allocate receipt amounts to invoices optimally.
+# Databricks notebook Python 3.10+
+# Copy up to N files between Unity Catalog Volumes with parallel I/O, retries, and basic validation.
 
-from __future__ import annotations
-import os, json, time, math, uuid, threading
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from fnmatch import fnmatch
+from time import sleep
+from typing import Iterable, List, Tuple
+import os
+import posixpath
+import random
 
-import numpy as np
-import faiss
+# ---------- CONFIG ----------
+SRC_ROOT = "/Volumes/<catalog>/<schema>/<src_volume>/"    # trailing slash ok
+DST_ROOT = "/Volumes/<catalog>/<schema>/<dst_volume>/"    # trailing slash ok
+INCLUDE_GLOB = "**/*"   # use e.g. "*.parquet" or "**/*.csv"
+EXCLUDE_GLOBS = []      # e.g. ["**/_delta_log/**", "**/.*/**"]
+N_LIMIT = 1000
+OVERWRITE = False
+MAX_WORKERS = 32        # driver-side parallelism
+MAX_RETRIES = 5
+# ----------------------------
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI
+def _norm(p: str) -> str:
+    p = p.replace("\\", "/")
+    return p if p.endswith("/") else p
 
-from pyspark.sql import DataFrame, types as T
+def _is_dir(info) -> bool:
+    # dbutils.fs.ls returns FileInfo-like with .path and .size (-1 for dirs)
+    return info.path.endswith("/")
 
-# Optional solver dependencies
-try:
-    from ortools.graph import pywrapgraph  # Faster, recommended
-    _HAS_ORTOOLS = True
-except Exception:
-    _HAS_ORTOOLS = False
-
-try:
-    import networkx as nx  # Fallback
-    _HAS_NETWORKX = True
-except Exception:
-    _HAS_NETWORKX = False
-
-
-# ============================ Config ============================
-
-@dataclass
-class EmbedConfig:
-    endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
-    deployment: str = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-large")
-    batch_size: int = 128
-    max_retries: int = 5
-    backoff: float = 1.5
-    normalize: bool = True
-    max_chars: int = 700
-
-@dataclass
-class RetrievalConfig:
-    # Retrieval & filters
-    top_k: int = 15
-    adaptive_topk_steps: Tuple[int, int, int] = (8, 12, 15)
-    faiss_pull_factor: int = 5
-    min_cosine: float = 0.2
-    amount_band_pct: float = 0.05  # ±5% around receipt amount to build allowed set
-    date_window_days: int = 150
-    currency_required: bool = True
-
-    # Matching tolerances
-    amount_tolerance_abs: float = 0.01
-    amount_tolerance_rel: float = 0.002
-
-@dataclass
-class LLMConfig:
-    endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
-    deployment: str = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4.1")
-    temperature: float = 0.0
-    max_retries: int = 4
-    backoff: float = 1.5
-    max_workers: int = 6           # receipt concurrency
-    max_concurrent_llm: int = 4    # cap concurrent chat calls with a semaphore
-
-@dataclass
-class FlowConfig:
-    # Scale all money to integer cents
-    cents_scale: int = 100
-    # Build edge cost from LLM/cosine/amount/date features: smaller cost = more likely
-    w_llm: float = 0.65
-    w_cosine: float = 0.25
-    w_amount_closeness: float = 0.07
-    w_date_proximity: float = 0.03
-    # To keep non-negative small ints, costs are: round(cost_scale*(1 - score))
-    cost_scale: int = 1000
-
-# ============================ Azure clients ============================
-
-def _azure_oai_client(endpoint: str, api_version: str) -> AzureOpenAI:
-    if not endpoint:
-        raise RuntimeError("AZURE_OPENAI_ENDPOINT is required.")
-    cred = DefaultAzureCredential()
-    token_provider = get_bearer_token_provider(cred, "https://cognitiveservices.azure.com/.default")
-    return AzureOpenAI(api_version=api_version, azure_endpoint=endpoint, azure_ad_token_provider=token_provider)
-
-# ============================ Utils ============================
-
-def _s(x: Any) -> str:
-    return "" if x is None else str(x).strip()
-
-def _to_float(x: Any) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
-
-def _parse_date(s: Any) -> Optional[datetime]:
-    if not s:
-        return None
-    ss = str(s).strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d-%b-%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(ss, fmt)
-        except Exception:
+def _walk_dir(root: str) -> Iterable[Tuple[str, int]]:
+    # Depth-first traversal using dbutils.fs.ls
+    stack = [root if root.endswith("/") else root + "/"]
+    seen = set()
+    while stack:
+        d = stack.pop()
+        if d in seen: 
             continue
-    return None
+        seen.add(d)
+        for info in dbutils.fs.ls(d):
+            if _is_dir(info):
+                stack.append(info.path)
+            else:
+                yield (info.path, info.size)
 
-def _days_diff(a: Optional[datetime], b: Optional[datetime]) -> Optional[int]:
-    if a and b:
-        return abs((a - b).days)
-    return None
+def _rel_path(full_path: str, root: str) -> str:
+    # Produce relative path under root
+    if not root.endswith("/"): root += "/"
+    if full_path.startswith(root):
+        return full_path[len(root):]
+    # Fallback: best-effort
+    return full_path.split("/")[-1]
 
-def _amount_close(s: float, t: float, abs_tol: float, rel_tol: float) -> bool:
-    tol = max(abs_tol, abs(t) * rel_tol)
-    return abs(s - t) <= tol
+def _match_any(globs: List[str], rel: str) -> bool:
+    return any(fnmatch(rel, g) for g in globs)
 
-def _amount_to_cents(x: Any, scale: int) -> int:
-    v = _to_float(x)
-    if math.isnan(v):
-        return 0
-    return int(round(v * scale))
+def _include(rel: str) -> bool:
+    inc = _match_any([INCLUDE_GLOB], rel) if INCLUDE_GLOB else True
+    exc = _match_any(EXCLUDE_GLOBS, rel) if EXCLUDE_GLOBS else False
+    return inc and not exc
 
-# ============================ Text composition ============================
+def _dst_path(dst_root: str, rel: str) -> str:
+    dst_root = dst_root if dst_root.endswith("/") else dst_root + "/"
+    return posixpath.join(dst_root, rel)
 
-def compose_invoice_text(inv: Dict[str, Any], max_chars: int) -> str:
-    amt = inv.get("amount") if inv.get("amount") is not None else inv.get("invamt")
-    return " ".join([
-        "INVOICE_LINE",
-        f"INVNO {_s(inv.get('invno'))}",
-        f"CUR {_s(inv.get('trancurr'))}",
-        f"AMT {_s(amt)}",
-        f"IDATE {_s(inv.get('invdate'))}",
-        f"DUEDATE {_s(inv.get('duedate'))}",
-        f"CUST {_s(inv.get('custno'))}",
-        f"CHK {_s(inv.get('checknum'))}",
-        f"PO {_s(inv.get('invponum'))}",
-        f"BAL {_s(inv.get('balance'))}",
-        f"ADDR {_s(inv.get('bill_to_address'))}",
-    ])[:max_chars]
+def _parent_dir(p: str) -> str:
+    return posixpath.dirname(p)
 
-def compose_receipt_text(r: Dict[str, Any], max_chars: int) -> str:
-    return " ".join([
-        "RECEIPT_LINE",
-        f"PAYER {_s(r.get('payercust_company'))}",
-        f"CUR {_s(r.get('currcode'))}",
-        f"AMT {_s(r.get('amount'))}",
-        f"RDATE {_s(r.get('receipt_date'))}",
-        f"CHK {_s(r.get('check_num'))}",
-        f"BATCH {_s(r.get('batch_id'))}",
-        f"MICR {_s(r.get('micr_routing'))}/{_s(r.get('micr_acct'))}",
-        f"UNAP {_s(r.get('unapplied_amount'))}",
-        f"ADDR {_s(r.get('payer_address'))}",
-        f"BANK {_s(r.get('bank_name'))}",
-    ])[:max_chars]
+def _exists(path: str) -> bool:
+    try:
+        dbutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
 
-# ============================ Embedding & FAISS ============================
+def _size_of(path: str) -> int:
+    try:
+        info = dbutils.fs.ls(path)
+        if len(info) == 1 and not _is_dir(info[0]):
+            return info[0].size
+        # If it listed a directory, return -1
+        return -1
+    except Exception:
+        return -1
 
-class EmbeddingClient:
-    def __init__(self, cfg: EmbedConfig):
-        self.cfg = cfg
-        self.client = _azure_oai_client(cfg.endpoint, cfg.api_version)
+def _mkdirs(path: str):
+    dbutils.fs.mkdirs(path)
 
-    def embed_batch(self, texts: List[str]) -> np.ndarray:
-        last_err = None
-        for i in range(self.cfg.max_retries):
+def _cp_once(src: str, dst: str, overwrite: bool) -> None:
+    # dbutils.fs.cp handles single file copy; not recursive here
+    dbutils.fs.cp(src, dst, recurse=False)
+    if not overwrite:
+        # Extra guard: if source updated during copy, sizes must match
+        s1 = _size_of(src)
+        d1 = _size_of(dst)
+        if s1 >= 0 and d1 >= 0 and s1 != d1:
+            # Remove the bad copy to avoid partials
             try:
-                resp = self.client.embeddings.create(input=texts, model=self.cfg.deployment)
-                vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-                if self.cfg.normalize:
-                    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
-                    vecs = vecs / norms
-                return vecs
-            except Exception as e:
-                last_err = e
-                time.sleep(self.cfg.backoff * (2 ** i))
-        raise RuntimeError(f"Embedding failed after retries: {last_err}")
-
-class FaissIndex:
-    """Cosine via inner product on normalized vectors."""
-    def __init__(self, dim: int):
-        self.index = faiss.IndexFlatIP(dim)
-        self.ids: List[str] = []
-    def add(self, ids: List[str], vecs: np.ndarray) -> None:
-        if vecs.dtype != np.float32: vecs = vecs.astype(np.float32)
-        self.index.add(vecs); self.ids.extend(ids)
-    def search_raw(self, q: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if q.ndim == 1: q = q.reshape(1, -1)
-        if q.dtype != np.float32: q = q.astype(np.float32)
-        D, I = self.index.search(q, k)
-        return D[0], I[0]
-
-# ============================ LLM edge scorer ============================
-
-_global_llm_sem: Optional[threading.Semaphore] = None
-
-class LLMEdgeScorer:
-    """One call per RECEIPT; returns per-edge confidence + explanation for its candidate invoices."""
-    def __init__(self, cfg: LLMConfig):
-        self.cfg = cfg
-        self.client = _azure_oai_client(cfg.endpoint, cfg.api_version)
-        global _global_llm_sem
-        if _global_llm_sem is None:
-            _global_llm_sem = threading.Semaphore(cfg.max_concurrent_llm)
-        self._sem = _global_llm_sem
-
-    def score_edges(self, receipt_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """
-        candidates: [{invoice_key, invno, amount, currency, invoice_date, due_date,
-                      customer_id, po_number, check_num, bill_to_address, customer_name,
-                      cosine, amount_delta, days_delta}, ...]
-        Returns: {invoice_key: {"confidence": float[0..1], "explanation": str}}
-        """
-        def _trim(d: Dict[str, Any]) -> Dict[str, Any]:
-            return {k: v for k, v in d.items() if v not in (None, "", [], {}, float("nan"))}
-
-        payload = {
-            "RECEIPT": _trim(receipt_ctx),
-            "CANDIDATE_EDGES": [_trim(c) for c in candidates],
-            "TASK": (
-                "Score each receipt→invoice edge for match likelihood. Consider: amount closeness, "
-                "currency equality, date proximity, payer vs customer/vendor names/addresses, check/PO, MICR/bank. "
-                "Return STRICT JSON mapping invoice_key -> {confidence, explanation}. "
-                "confidence ∈ [0,1] (calibrated, conservative); explanation ≤ 120 chars."
-            )
-        }
-        messages = [
-            {"role": "system", "content": "You are a Financial Matching Assistant. Return strict JSON only; no prose; do not invent values."},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-        ]
-
-        last_err = None
-        for attempt in range(self.cfg.max_retries):
-            try:
-                with self._sem:
-                    resp = self.client.chat.completions.create(
-                        model=self.cfg.deployment,
-                        messages=messages,
-                        temperature=self.cfg.temperature,
-                        response_format={"type": "json_object"},
-                    )
-                raw = resp.choices[0].message.content if resp.choices else "{}"
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    s, e = raw.find("{"), raw.rfind("}")
-                    data = json.loads(raw[s:e+1]) if (s != -1 and e != -1 and e > s) else {}
-                out: Dict[str, Dict[str, Any]] = {}
-                for k, obj in (data or {}).items():
-                    conf = obj.get("confidence", 0)
-                    expl = obj.get("explanation", "")
-                    try:
-                        conf = float(conf)
-                        conf = max(0.0, min(1.0, conf))
-                    except Exception:
-                        conf = 0.0
-                    if not isinstance(expl, str):
-                        expl = str(expl)
-                    if len(expl) > 120:
-                        expl = expl[:117] + "..."
-                    out[str(k)] = {"confidence": conf, "explanation": expl}
-                return out
-            except Exception as e:
-                last_err = e
-                time.sleep(self.cfg.backoff * (2 ** attempt))
-        # fallback: zeros
-        return {c["invoice_key"]: {"confidence": 0.0, "explanation": f"LLM edge scoring failed: {last_err}"} for c in candidates}
-
-# ============================ Orchestrator ============================
-
-class GlobalMinCostReconciler:
-    """
-    Build a global bipartite min-cost flow:
-      source -> receipt nodes (capacity = receipt amount in cents)
-      receipt -> invoice edges (capacity up to min(receipt, invoice) in cents, cost from LLM/cosine/features)
-      invoice -> sink (capacity = invoice amount in cents)
-    Solve to minimize total cost (maximize overall match quality).
-    """
-
-    def __init__(self, spark,
-                 emb_cfg: EmbedConfig = EmbedConfig(),
-                 retr_cfg: RetrievalConfig = RetrievalConfig(),
-                 llm_cfg: LLMConfig = LLMConfig(),
-                 flow_cfg: FlowConfig = FlowConfig()):
-        self.spark = spark
-        self.emb_cfg = emb_cfg
-        self.retr_cfg = retr_cfg
-        self.llm_cfg = llm_cfg
-        self.flow_cfg = flow_cfg
-
-        self.emb = EmbeddingClient(emb_cfg)
-        self.llm = LLMEdgeScorer(llm_cfg)
-
-    # ---------- Build invoice index & meta, plus lookup buckets for prefilter ----------
-    def _build_invoice_index(self, df_invoices: DataFrame) -> Tuple[FaissIndex, Dict[str, Dict[str, Any]], int, Dict[str, List[str]], Dict[str, List[str]], Dict[str, List[str]]]:
-        cols = [
-            "invno","invdate","duedate","amount","invamt","trancurr","custno","checknum","invponum","balance",
-            "bill_to_address","ship_to_address","customer_name"
-        ]
-        existing = [c for c in cols if c in df_invoices.columns]
-        inv_rows = [r.asDict() for r in df_invoices.select(*existing).collect()]
-
-        ids, texts = [], []
-        meta: Dict[str, Dict[str, Any]] = {}
-
-        cur_bucket: Dict[str, List[str]] = {}
-        ym_bucket: Dict[str, List[str]] = {}
-        amt_bucket: Dict[str, List[str]] = {}
-
-        for j, inv in enumerate(inv_rows):
-            key = f"{_s(inv.get('invno'))}|{j}"
-            ids.append(key)
-            meta[key] = inv
-            texts.append(compose_invoice_text(inv, self.emb_cfg.max_chars))
-
-            cur = _s(inv.get("trancurr"))
-            if cur:
-                cur_bucket.setdefault(cur, []).append(key)
-
-            idt = _parse_date(inv.get("invdate"))
-            if idt:
-                ym = f"{idt.year:04d}-{idt.month:02d}"
-                ym_bucket.setdefault(ym, []).append(key)
-
-            amt = inv.get("amount") if inv.get("amount") is not None else inv.get("invamt")
-            try:
-                b = int(round(float(amt)))
-                amt_bucket.setdefault(str(b), []).append(key)
+                dbutils.fs.rm(dst)
             except Exception:
                 pass
+            raise IOError(f"Size mismatch after copy: {src} ({s1}) -> {dst} ({d1})")
 
-        if not texts:
-            V = np.zeros((0, 1536), dtype=np.float32); dim = 1536
-        else:
-            batched = []
-            for i in range(0, len(texts), self.emb_cfg.batch_size):
-                batched.append(self.emb.embed_batch(texts[i:i+self.emb_cfg.batch_size]))
-            V = np.vstack(batched); dim = V.shape[1]
-        index = FaissIndex(dim)
-        if V.size:
-            index.add(ids, V)
-        return index, meta, dim, cur_bucket, ym_bucket, amt_bucket
+def _copy_with_retries(src: str, dst: str, overwrite: bool, retries: int) -> Tuple[str, bool, str]:
+    # Returns (path, success, message)
+    # Skip if exists and not overwriting and size matches
+    if _exists(dst) and not overwrite:
+        ssz = _size_of(src)
+        dsz = _size_of(dst)
+        if ssz >= 0 and ssz == dsz:
+            return (dst, True, "skipped_exists")
+    # Ensure parent
+    _mkdirs(_parent_dir(dst))
+    delay = 0.5
+    for attempt in range(retries + 1):
+        try:
+            _cp_once(src, dst, overwrite=overwrite)
+            return (dst, True, "copied")
+        except Exception as e:
+            if attempt == retries:
+                return (dst, False, f"error: {type(e).__name__}: {e}")
+            # Jittered backoff
+            sleep(delay + random.random() * 0.25)
+            delay = min(delay * 2, 10.0)
+    return (dst, False, "unknown")
 
-    def _allowed_invoice_keys(self, receipt: Dict[str, Any],
-                              cur_bucket, ym_bucket, amt_bucket) -> Optional[set]:
-        cur = _s(receipt.get("currcode"))
-        r_amt = _to_float(receipt.get("amount"))
-        r_date = _parse_date(receipt.get("receipt_date"))
-
-        # amount band
-        if math.isnan(r_amt):
-            amount_keys = None
-        else:
-            lo = int(round(r_amt * (1 - self.retr_cfg.amount_band_pct)))
-            hi = int(round(r_amt * (1 + self.retr_cfg.amount_band_pct)))
-            amount_keys = set()
-            for v in range(min(lo, hi), max(lo, hi) + 1):
-                lst = amt_bucket.get(str(v))
-                if lst:
-                    amount_keys.update(lst)
-
-        # month ±4 range (coarse)
-        month_keys = set()
-        if r_date:
-            for k in range(-4, 5):
-                y = r_date.year + ((r_date.month - 1 + k) // 12)
-                m = ((r_date.month - 1 + k) % 12) + 1
-                ym = f"{y:04d}-{m:02d}"
-                lst = ym_bucket.get(ym)
-                if lst:
-                    month_keys.update(lst)
-
-        currency_keys = set(cur_bucket.get(cur, [])) if (cur and self.retr_cfg.currency_required) else None
-
-        sets = [s for s in [amount_keys, month_keys, currency_keys] if s]
-        if not sets:
-            return None
-        allowed = sets[0]
-        for s in sets[1:]:
-            allowed = allowed.intersection(s)
-            if not allowed:
+def list_candidate_files(src_root: str) -> List[Tuple[str, int, str]]:
+    src_root = _norm(src_root)
+    files = []
+    for path, size in _walk_dir(src_root):
+        rel = _rel_path(path, src_root)
+        if _include(rel):
+            files.append((path, size, rel))
+            if len(files) >= N_LIMIT:
                 break
-        return allowed
+    return files
 
-    # ---------- Build candidate edges with features ----------
-    def _build_edges_for_receipt(self, q_vec: np.ndarray, receipt: Dict[str, Any],
-                                 index: FaissIndex, meta: Dict[str, Dict[str, Any]],
-                                 allowed_keys: Optional[set]) -> List[Dict[str, Any]]:
-        # Adaptive retrieve
-        edges: List[Dict[str, Any]] = []
-        r_amount = _to_float(receipt.get("amount"))
-        r_date = _parse_date(receipt.get("receipt_date"))
+def copy_files(src_root: str, dst_root: str) -> None:
+    src_root = _norm(src_root)
+    dst_root = _norm(dst_root)
+    if not src_root.startswith("/Volumes/") or not dst_root.startswith("/Volumes/"):
+        raise ValueError("Use Unity Catalog Volume paths under /Volumes/<catalog>/<schema>/<volume>/")
+    candidates = list_candidate_files(src_root)
+    if not candidates:
+        print("No files matched.")
+        return
+    print(f"Planning to copy {len(candidates)} files (limit={N_LIMIT}).")
 
-        if index.index.ntotal == 0 or math.isnan(r_amount):
-            return []
+    results = {"copied": 0, "skipped_exists": 0, "failed": 0}
+    failures = []
 
-        for k_target in self.retr_cfg.adaptive_topk_steps:
-            pull = min(index.index.ntotal, max(k_target * self.retr_cfg.faiss_pull_factor, k_target))
-            D, I = index.search_raw(q_vec, pull)
-            fetched = []
-            for pos, score in zip(I, D):
-                if pos == -1: continue
-                if score < self.retr_cfg.min_cosine: continue
-                key = index.ids[pos]
-                if allowed_keys is not None and key not in allowed_keys:
-                    continue
-                fetched.append((key, float(score)))
-                if len(fetched) >= k_target:
-                    break
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = []
+        for src, _, rel in candidates:
+            dst = _dst_path(dst_root, rel)
+            futs.append(ex.submit(_copy_with_retries, src, dst, OVERWRITE, MAX_RETRIES))
+        for f in as_completed(futs):
+            dst, ok, msg = f.result()
+            if ok and msg == "copied":
+                results["copied"] += 1
+            elif ok and msg == "skipped_exists":
+                results["skipped_exists"] += 1
+            else:
+                results["failed"] += 1
+                failures.append((dst, msg))
 
-            # Convert to edges with extra numeric features
-            edges = []
-            for key, cos in fetched:
-                inv = meta.get(key, {})
-                i_amount = inv.get("amount") if inv.get("amount") is not None else inv.get("invamt")
-                i_amount_f = _to_float(i_amount)
-                i_date = _parse_date(inv.get("invdate"))
-                days = _days_diff(r_date, i_date) or 365  # default large
-                amount_delta = abs(r_amount - (i_amount_f if not math.isnan(i_amount_f) else 0.0))
-                edges.append({
-                    "invoice_key": key,
-                    "invno": _s(inv.get("invno")),
-                    "amount": i_amount,
-                    "currency": _s(inv.get("trancurr")),
-                    "invoice_date": _s(inv.get("invdate")),
-                    "due_date": _s(inv.get("duedate")),
-                    "customer_id": _s(inv.get("custno")),
-                    "po_number": _s(inv.get("invponum")),
-                    "check_num": _s(inv.get("checknum")),
-                    "bill_to_address": _s(inv.get("bill_to_address")),
-                    "customer_name": _s(inv.get("customer_name")),
-                    "cosine": cos,
-                    "amount_delta": amount_delta,
-                    "days_delta": days
-                })
+    print(f"Done. Copied={results['copied']}, Skipped={results['skipped_exists']}, Failed={results['failed']}")
+    if failures:
+        print("Failures (sample up to 20):")
+        for p, m in failures[:20]:
+            print(f"- {p}: {m}")
 
-            # If we got some edges, stop widening (we use LLM to decide)
-            if edges:
-                break
+# ---- RUN ----
+# Set the config above, then execute:
+copy_files(SRC_ROOT, DST_ROOT)
 
-        return edges
-
-    # ---------- Cost function ----------
-    def _edge_cost(self, llm_conf: float, cosine: float, amount_delta: float, receipt_amount: float, days_delta: float) -> int:
-        # Normalize amount closeness [0..1], 1 is perfect
-        if receipt_amount > 0 and not math.isnan(receipt_amount):
-            amt_close = max(0.0, 1.0 - (amount_delta / max(receipt_amount, 1e-9)))
-            amt_close = min(1.0, amt_close)
-        else:
-            amt_close = 0.0
-
-        # Date proximity score [0..1]: 0 at 365+ days, 1 at 0 days
-        date_score = max(0.0, 1.0 - (min(days_delta, 365.0) / 365.0))
-
-        # Weighted score in [0..1]
-        score = (self.flow_cfg.w_llm * llm_conf +
-                 self.flow_cfg.w_cosine * cosine +
-                 self.flow_cfg.w_amount_closeness * amt_close +
-                 self.flow_cfg.w_date_proximity * date_score)
-        score = max(0.0, min(1.0, score))
-        # Convert to non-negative small integer cost
-        return int(round(self.flow_cfg.cost_scale * (1.0 - score)))
-
-    # ---------- Solver (OR-Tools or NetworkX) ----------
-    def _solve_flow(self,
-                    receipts: List[Dict[str, Any]],
-                    invoices: Dict[str, Dict[str, Any]],
-                    edges_scored: Dict[Tuple[str, str], Dict[str, Any]]) -> List[Tuple[str, str, int]]:
-        """
-        receipts: [{rid, amount_cents}, ...]
-        invoices: key -> meta (with amount_cents)
-        edges_scored: (rid, invoice_key) -> {"cost": int, "cap": int}
-        Returns list of (rid, invoice_key, flow_cents) for flows > 0
-        """
-        # Node indices
-        # We build a simple super-source/sink network:
-        # S -> R_i (capacity = receipt amount)
-        # R_i -> I_j (capacity and cost per edge)
-        # I_j -> T (capacity = invoice amount)
-        if _HAS_ORTOOLS:
-            # OR-Tools MinCostFlow
-            mcf = pywrapgraph.SimpleMinCostFlow()
-            node_id = {}
-            next_id = 0
-            def nid(x):
-                nonlocal next_id
-                if x not in node_id:
-                    node_id[x] = next_id
-                    next_id += 1
-                return node_id[x]
-
-            S = nid("S")
-            T = nid("T")
-
-            # Add arcs S->R
-            for r in receipts:
-                rnode = nid(f"R:{r['rid']}")
-                mcf.AddArcWithCapacityAndUnitCost(S, rnode, int(r["amount_cents"]), 0)
-
-            # Add arcs I->T
-            for inv_key, inv in invoices.items():
-                inode = nid(f"I:{inv_key}")
-                mcf.AddArcWithCapacityAndUnitCost(inode, T, int(inv["amount_cents"]), 0)
-
-            # Add arcs R->I with costs
-            for (rid, inv_key), info in edges_scored.items():
-                cap = max(0, int(info["cap"]))
-                if cap <= 0: 
-                    continue
-                cost = int(info["cost"])
-                rnode = nid(f"R:{rid}")
-                inode = nid(f"I:{inv_key}")
-                mcf.AddArcWithCapacityAndUnitCost(rnode, inode, cap, cost)
-
-            # Supplies: + at S, − at T
-            total_receipts = sum(int(r["amount_cents"]) for r in receipts)
-            total_invoices = sum(int(inv["amount_cents"]) for inv in invoices.values())
-            # We only can push as much as min(total_receipts, total_invoices)
-            # SimpleMinCostFlow requires node supplies:
-            mcf.SetNodeSupply(S, min(total_receipts, total_invoices))
-            mcf.SetNodeSupply(T, -min(total_receipts, total_invoices))
-
-            status = mcf.Solve()
-            if status != mcf.OPTIMAL:
-                # No feasible or optimal solution; return empty
-                return []
-
-            flows: List[Tuple[str, str, int]] = []
-            for i in range(mcf.NumArcs()):
-                tail = mcf.Tail(i)
-                head = mcf.Head(i)
-                flow = mcf.Flow(i)
-                if flow <= 0:
-                    continue
-                # decode R->I arcs (ignore S->R and I->T)
-                tail_name = [k for k, v in node_id.items() if v == tail][0]
-                head_name = [k for k, v in node_id.items() if v == head][0]
-                if tail_name.startswith("R:") and head_name.startswith("I:"):
-                    rid = tail_name[2:]
-                    inv_key = head_name[2:]
-                    flows.append((rid, inv_key, int(flow)))
-            return flows
-
-        elif _HAS_NETWORKX:
-            # NetworkX min_cost_flow with integer demands
-            G = nx.DiGraph()
-            # Build nodes with demands
-            # We'll use demand formulation: sum of demands = 0
-            # Source has negative demand (-supply), Sink has positive demand (+demand)
-            total_send = min(sum(r["amount_cents"] for r in receipts),
-                             sum(inv["amount_cents"] for inv in invoices.values()))
-
-            G.add_node("S", demand=-int(total_send))
-            G.add_node("T", demand=int(total_send))
-
-            # S->R
-            for r in receipts:
-                rn = f"R:{r['rid']}"
-                G.add_node(rn, demand=0)
-                G.add_edge("S", rn, capacity=int(r["amount_cents"]), weight=0)
-
-            # I->T
-            for inv_key, inv in invoices.items():
-                in_ = f"I:{inv_key}"
-                G.add_node(in_, demand=0)
-                G.add_edge(in_, "T", capacity=int(inv["amount_cents"]), weight=0)
-
-            # R->I with costs
-            for (rid, inv_key), info in edges_scored.items():
-                cap = max(0, int(info["cap"]))
-                if cap <= 0: 
-                    continue
-                cost = int(info["cost"])
-                rn = f"R:{rid}"
-                in_ = f"I:{inv_key}"
-                G.add_edge(rn, in_, capacity=cap, weight=cost)
-
-            flow_dict = nx.min_cost_flow(G)
-            # Extract flows on R->I
-            flows: List[Tuple[str, str, int]] = []
-            for rn, nbrs in flow_dict.items():
-                if not rn.startswith("R:"):
-                    continue
-                rid = rn[2:]
-                for in_, amt in nbrs.items():
-                    if not in_.startswith("I:"):
-                        continue
-                    if amt > 0:
-                        inv_key = in_[2:]
-                        flows.append((rid, inv_key, int(amt)))
-            return flows
-        else:
-            raise RuntimeError("Neither OR-Tools nor NetworkX available to solve min-cost flow.")
-
-    # ---------- Public run ----------
-    def run(self, df_invoices_line_level: DataFrame, df_receipts_line_level: DataFrame) -> DataFrame:
-        # 1) Build invoice index + buckets
-        index, meta, dim, cur_bucket, ym_bucket, amt_bucket = self._build_invoice_index(df_invoices_line_level)
-
-        # 2) Collect + embed receipts
-        r_cols = [
-            "receipt_id","receipt_num","check_num","batch_id","amount","receipt_date","currcode",
-            "micr_routing","micr_acct","payercust_company","unapplied_amount","bank_name","payer_address"
-        ]
-        r_exist = [c for c in r_cols if c in df_receipts_line_level.columns]
-        receipts_rows = [r.asDict() for r in df_receipts_line_level.select(*r_exist).collect()]
-
-        # Embed receipts (strings)
-        def r_text(r): return compose_receipt_text(r, self.emb_cfg.max_chars)
-        r_texts = [r_text(r) for r in receipts_rows]
-        if r_texts:
-            parts = []
-            for i in range(0, len(r_texts), self.emb_cfg.batch_size):
-                parts.append(self.emb.embed_batch(r_texts[i:i+self.emb_cfg.batch_size]))
-            R = np.vstack(parts)
-        else:
-            R = np.zeros((0, dim), dtype=np.float32)
-
-        # 3) Build candidate edges per receipt, LLM-score edges (parallel)
-        def score_one_receipt(i: int):
-            r = receipts_rows[i]
-            rid = _s(r.get("receipt_id"))
-            q = R[i]
-            allowed = self._allowed_invoice_keys(r, cur_bucket, ym_bucket, amt_bucket)
-            cand = self._build_edges_for_receipt(q, r, index, meta, allowed)
-            if not cand:
-                return rid, [], {}
-            # Build receipt ctx for LLM
-            ctx = {
-                "receipt_id": rid,
-                "amount": r.get("amount"),
-                "currency": r.get("currcode"),
-                "receipt_date": _s(r.get("receipt_date")),
-                "check_num": _s(r.get("check_num")),
-                "batch_id": _s(r.get("batch_id")),
-                "payer_name": _s(r.get("payercust_company")),
-                "payer_address": _s(r.get("payer_address")),
-                "bank_name": _s(r.get("bank_name")),
-                "micr_routing": _s(r.get("micr_routing")),
-                "micr_acct": _s(r.get("micr_acct")),
-            }
-            scores = self.llm.score_edges(ctx, cand)
-            return rid, cand, scores
-
-        results_cands: Dict[str, List[Dict[str, Any]]] = {}
-        results_scores: Dict[Tuple[str, str], Dict[str, Any]] = {}
-
-        with ThreadPoolExecutor(max_workers=self.llm_cfg.max_workers) as ex:
-            futs = {ex.submit(score_one_receipt, i): i for i in range(len(receipts_rows))}
-            for fut in as_completed(futs):
-                rid, cand, scores = fut.result()
-                results_cands[rid] = cand
-                for c in cand:
-                    inv_key = c["invoice_key"]
-                    s = scores.get(inv_key, {"confidence": 0.0, "explanation": ""})
-                    results_scores[(rid, inv_key)] = {
-                        "llm_conf": float(s["confidence"]),
-                        "explanation": s.get("explanation", ""),
-                        "cosine": float(c["cosine"]),
-                        "amount_delta": float(c["amount_delta"]),
-                        "days_delta": float(c["days_delta"]),
-                    }
-
-        # 4) Prepare solver inputs
-        # Receipts with amount in cents
-        receipts_caps = []
-        for r in receipts_rows:
-            rid = _s(r.get("receipt_id"))
-            amt_c = _amount_to_cents(r.get("amount"), self.flow_cfg.cents_scale)
-            if amt_c <= 0:
-                continue
-            receipts_caps.append({"rid": rid, "amount_cents": amt_c, "raw": r})
-
-        # Invoices with amount in cents (full capacity)
-        invoices_caps: Dict[str, Dict[str, Any]] = {}
-        for key, inv in meta.items():
-            amt = inv.get("amount") if inv.get("amount") is not None else inv.get("invamt")
-            amt_c = _amount_to_cents(amt, self.flow_cfg.cents_scale)
-            if amt_c <= 0:
-                continue
-            invoices_caps[key] = {"amount_cents": amt_c, "raw": inv}
-
-        # Edge costs & caps (cap is theoretically min(receipt, invoice). We'll let solver choose up to need.)
-        edges_scored: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for (rid, inv_key), feats in results_scores.items():
-            # If either endpoint missing capacity, skip
-            if rid not in {x["rid"] for x in receipts_caps}: 
-                continue
-            if inv_key not in invoices_caps:
-                continue
-
-            # Currency gate (optional strict)
-            rraw = next(x["raw"] for x in receipts_caps if x["rid"] == rid)
-            iraw = invoices_caps[inv_key]["raw"]
-            if self.retr_cfg.currency_required:
-                if _s(rraw.get("currcode")) and _s(iraw.get("trancurr")) and _s(rraw.get("currcode")) != _s(iraw.get("trancurr")):
-                    continue  # disallow cross-currency edges
-
-            r_amt = _to_float(rraw.get("amount"))
-            llm_conf = feats["llm_conf"]
-            cosine = feats["cosine"]
-            amt_delta = feats["amount_delta"]
-            days_delta = feats["days_delta"]
-
-            cost = self._edge_cost(llm_conf, cosine, amt_delta, r_amt, days_delta)
-            # Max capacity for the edge = min(receipt_cents, invoice_cents)
-            rc = next(x["amount_cents"] for x in receipts_caps if x["rid"] == rid)
-            ic = invoices_caps[inv_key]["amount_cents"]
-            cap = min(rc, ic)
-            edges_scored[(rid, inv_key)] = {"cost": int(cost), "cap": int(cap)}
-
-        # 5) Solve min-cost flow
-        flows = self._solve_flow(receipts_caps, invoices_caps, edges_scored)
-
-        # 6) Emit results: one row per positive flow (allocation)
-        schema = T.StructType([
-            # Allocation
-            T.StructField("allocation_id", T.StringType(), False),
-            T.StructField("allocated_amount", T.DoubleType(), True),    # in original currency units
-            T.StructField("allocated_amount_cents", T.IntegerType(), True),
-            T.StructField("unit_currency", T.StringType(), True),
-
-            # Edge scores
-            T.StructField("llm_confidence", T.DoubleType(), True),
-            T.StructField("cosine_similarity", T.DoubleType(), True),
-            T.StructField("edge_explanation", T.StringType(), True),
-            T.StructField("edge_cost", T.IntegerType(), True),
-
-            # Receipt fields
-            T.StructField("receipt_id", T.StringType(), True),
-            T.StructField("r_amount", T.StringType(), True),
-            T.StructField("r_receipt_date", T.StringType(), True),
-            T.StructField("r_currency", T.StringType(), True),
-            T.StructField("r_check_num", T.StringType(), True),
-            T.StructField("r_batch_id", T.StringType(), True),
-            T.StructField("r_micr_routing", T.StringType(), True),
-            T.StructField("r_micr_acct", T.StringType(), True),
-            T.StructField("r_payer_name", T.StringType(), True),
-            T.StructField("r_unapplied_amount", T.StringType(), True),
-            T.StructField("r_bank_name", T.StringType(), True),
-            T.StructField("r_payer_address", T.StringType(), True),
-
-            # Invoice fields
-            T.StructField("invoice_key", T.StringType(), True),
-            T.StructField("invno", T.StringType(), True),
-            T.StructField("i_amount", T.StringType(), True),
-            T.StructField("i_invdate", T.StringType(), True),
-            T.StructField("i_duedate", T.StringType(), True),
-            T.StructField("i_currency", T.StringType(), True),
-            T.StructField("i_custno", T.StringType(), True),
-            T.StructField("i_checknum", T.StringType(), True),
-            T.StructField("i_invponum", T.StringType(), True),
-            T.StructField("i_balance", T.StringType(), True),
-            T.StructField("i_bill_to_address", T.StringType(), True),
-            T.StructField("i_customer_name", T.StringType(), True),
-        ])
-
-        if not flows:
-            return self.spark.createDataFrame([], schema=schema)
-
-        # Build fast lookup
-        r_map = { _s(r["rid"]): r for r in receipts_caps }
-        inv_map = invoices_caps
-
-        rows = []
-        for rid, inv_key, flow_cents in flows:
-            rc = r_map[rid]["raw"]
-            ic = inv_map[inv_key]["raw"]
-            feats = results_scores.get((rid, inv_key), None)
-            if feats is None:
-                # If edge not scored (filtered out), skip
-                continue
-            # Cost reconstructed
-            r_amt_f = _to_float(rc.get("amount"))
-            edge_cost = self._edge_cost(feats["llm_conf"], feats["cosine"], feats["amount_delta"], r_amt_f, feats["days_delta"])
-            rows.append({
-                "allocation_id": str(uuid.uuid4()),
-                "allocated_amount": float(flow_cents) / self.flow_cfg.cents_scale,
-                "allocated_amount_cents": int(flow_cents),
-                "unit_currency": _s(rc.get("currcode")) or _s(ic.get("trancurr")),
-
-                "llm_confidence": feats["llm_conf"],
-                "cosine_similarity": feats["cosine"],
-                "edge_explanation": feats["explanation"],
-                "edge_cost": int(edge_cost),
-
-                "receipt_id": _s(rc.get("receipt_id")),
-                "r_amount": _s(rc.get("amount")),
-                "r_receipt_date": _s(rc.get("receipt_date")),
-                "r_currency": _s(rc.get("currcode")),
-                "r_check_num": _s(rc.get("check_num")),
-                "r_batch_id": _s(rc.get("batch_id")),
-                "r_micr_routing": _s(rc.get("micr_routing")),
-                "r_micr_acct": _s(rc.get("micr_acct")),
-                "r_payer_name": _s(rc.get("payercust_company")),
-                "r_unapplied_amount": _s(rc.get("unapplied_amount")),
-                "r_bank_name": _s(rc.get("bank_name")),
-                "r_payer_address": _s(rc.get("payer_address")),
-
-                "invoice_key": inv_key,
-                "invno": _s(ic.get("invno")),
-                "i_amount": _s(ic.get("amount") if ic.get("amount") is not None else ic.get("invamt")),
-                "i_invdate": _s(ic.get("invdate")),
-                "i_duedate": _s(ic.get("duedate")),
-                "i_currency": _s(ic.get("trancurr")),
-                "i_custno": _s(ic.get("custno")),
-                "i_checknum": _s(ic.get("checknum")),
-                "i_invponum": _s(ic.get("invponum")),
-                "i_balance": _s(ic.get("balance")),
-                "i_bill_to_address": _s(ic.get("bill_to_address")),
-                "i_customer_name": _s(ic.get("customer_name")),
-            })
-
-        return self.spark.createDataFrame(rows, schema=schema)
-
-
-# ============================ Example usage (Databricks) ============================
-if __name__ == "__main__":
-    # Example (uncomment and adapt to your catalog)
-    # df_invoices_line_level = spark.table("main.finance.df_invoices_line_level")
-    # df_receipts_line_level = spark.table("main.finance.df_receipts_line_level")
-    #
-    # reconciler = GlobalMinCostReconciler(
-    #     spark,
-    #     emb_cfg=EmbedConfig(batch_size=128, normalize=True, max_chars=700),
-    #     retr_cfg=RetrievalConfig(
-    #         top_k=15, adaptive_topk_steps=(8,12,15), faiss_pull_factor=5, min_cosine=0.2,
-    #         amount_band_pct=0.05, date_window_days=150, currency_required=True,
-    #         amount_tolerance_abs=0.01, amount_tolerance_rel=0.002
-    #     ),
-    #     llm_cfg=LLMConfig(deployment="gpt-4.1", temperature=0.0, max_workers=6, max_concurrent_llm=4),
-    #     flow_cfg=FlowConfig(cents_scale=100, w_llm=0.65, w_cosine=0.25, w_amount_closeness=0.07, w_date_proximity=0.03, cost_scale=1000)
-    # )
-    # result_df = reconciler.run(df_invoices_line_level, df_receipts_line_level)
-    # display(result_df)
-    pass
