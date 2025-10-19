@@ -1,176 +1,168 @@
-# Databricks notebook Python 3.10+
-# Copy up to N files between Unity Catalog Volumes with parallel I/O, retries, and basic validation.
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from fnmatch import fnmatch
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
+from threading import Lock
 from time import sleep
-from typing import Iterable, List, Tuple
-import os
-import posixpath
-import random
+import posixpath, random
 
-# ---------- CONFIG ----------
-SRC_ROOT = "/Volumes/<catalog>/<schema>/<src_volume>/"    # trailing slash ok
-DST_ROOT = "/Volumes/<catalog>/<schema>/<dst_volume>/"    # trailing slash ok
-INCLUDE_GLOB = "**/*"   # use e.g. "*.parquet" or "**/*.csv"
-EXCLUDE_GLOBS = []      # e.g. ["**/_delta_log/**", "**/.*/**"]
-N_LIMIT = 1000
-OVERWRITE = False
-MAX_WORKERS = 32        # driver-side parallelism
-MAX_RETRIES = 5
-# ----------------------------
+SRC_ROOT = "/Volumes/<catalog>/<schema>/<src_volume>/"
+DST_ROOT = "/Volumes/<catalog>/<schema>/<dst_volume>/"
+TARGET_COUNT = 1000
+MAX_DIR_LISTS = 8000
+MAX_LIST_WORKERS = 16
+MAX_COPY_WORKERS = 64
+MAX_RETRIES = 3
+OVERWRITE = True
+VALIDATE_SIZE = False
+RANDOM_SEED = 42
 
-def _norm(p: str) -> str:
+if RANDOM_SEED is not None:
+    random.seed(RANDOM_SEED)
+
+def _norm_dir(p):
     p = p.replace("\\", "/")
-    return p if p.endswith("/") else p
+    return p if p.endswith("/") else p + "/"
 
-def _is_dir(info) -> bool:
-    # dbutils.fs.ls returns FileInfo-like with .path and .size (-1 for dirs)
-    return info.path.endswith("/")
+def _rel(src_full, root):
+    root = _norm_dir(root)
+    return src_full[len(root):] if src_full.startswith(root) else src_full.split("/")[-1]
 
-def _walk_dir(root: str) -> Iterable[Tuple[str, int]]:
-    # Depth-first traversal using dbutils.fs.ls
-    stack = [root if root.endswith("/") else root + "/"]
-    seen = set()
-    while stack:
-        d = stack.pop()
-        if d in seen: 
-            continue
-        seen.add(d)
-        for info in dbutils.fs.ls(d):
-            if _is_dir(info):
-                stack.append(info.path)
-            else:
-                yield (info.path, info.size)
+def _parent_dir(p):
+    return posixpath.dirname(p.rstrip("/"))
 
-def _rel_path(full_path: str, root: str) -> str:
-    # Produce relative path under root
-    if not root.endswith("/"): root += "/"
-    if full_path.startswith(root):
-        return full_path[len(root):]
-    # Fallback: best-effort
-    return full_path.split("/")[-1]
+def _dst_for(rel):
+    return posixpath.join(_norm_dir(DST_ROOT), rel)
 
-def _match_any(globs: List[str], rel: str) -> bool:
-    return any(fnmatch(rel, g) for g in globs)
+def _mkdirs(p):
+    dbutils.fs.mkdirs(p)
 
-def _include(rel: str) -> bool:
-    inc = _match_any([INCLUDE_GLOB], rel) if INCLUDE_GLOB else True
-    exc = _match_any(EXCLUDE_GLOBS, rel) if EXCLUDE_GLOBS else False
-    return inc and not exc
-
-def _dst_path(dst_root: str, rel: str) -> str:
-    dst_root = dst_root if dst_root.endswith("/") else dst_root + "/"
-    return posixpath.join(dst_root, rel)
-
-def _parent_dir(p: str) -> str:
-    return posixpath.dirname(p)
-
-def _exists(path: str) -> bool:
+def _exists(path):
     try:
         dbutils.fs.ls(path)
         return True
     except Exception:
         return False
 
-def _size_of(path: str) -> int:
+def _size_of(path):
     try:
         info = dbutils.fs.ls(path)
-        if len(info) == 1 and not _is_dir(info[0]):
+        if len(info) == 1 and not info[0].path.endswith("/"):
             return info[0].size
-        # If it listed a directory, return -1
         return -1
     except Exception:
         return -1
 
-def _mkdirs(path: str):
-    dbutils.fs.mkdirs(path)
-
-def _cp_once(src: str, dst: str, overwrite: bool) -> None:
-    # dbutils.fs.cp handles single file copy; not recursive here
+def _copy_once(src, dst):
     dbutils.fs.cp(src, dst, recurse=False)
-    if not overwrite:
-        # Extra guard: if source updated during copy, sizes must match
-        s1 = _size_of(src)
-        d1 = _size_of(dst)
-        if s1 >= 0 and d1 >= 0 and s1 != d1:
-            # Remove the bad copy to avoid partials
-            try:
-                dbutils.fs.rm(dst)
-            except Exception:
-                pass
-            raise IOError(f"Size mismatch after copy: {src} ({s1}) -> {dst} ({d1})")
 
-def _copy_with_retries(src: str, dst: str, overwrite: bool, retries: int) -> Tuple[str, bool, str]:
-    # Returns (path, success, message)
-    # Skip if exists and not overwriting and size matches
-    if _exists(dst) and not overwrite:
-        ssz = _size_of(src)
-        dsz = _size_of(dst)
-        if ssz >= 0 and ssz == dsz:
-            return (dst, True, "skipped_exists")
-    # Ensure parent
-    _mkdirs(_parent_dir(dst))
-    delay = 0.5
-    for attempt in range(retries + 1):
+def _copy_with_retries(src, dst, mkdir_cache, cache_lock):
+    dparent = _parent_dir(dst)
+    with cache_lock:
+        if dparent not in mkdir_cache:
+            _mkdirs(dparent)
+            mkdir_cache.add(dparent)
+    if not OVERWRITE and _exists(dst):
+        if VALIDATE_SIZE:
+            ssz, dsz = _size_of(src), _size_of(dst)
+            if ssz >= 0 and dsz >= 0 and ssz == dsz:
+                return ("skipped_exists", dst)
+        else:
+            return ("skipped_exists", dst)
+    delay = 0.25
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            _cp_once(src, dst, overwrite=overwrite)
-            return (dst, True, "copied")
-        except Exception as e:
-            if attempt == retries:
-                return (dst, False, f"error: {type(e).__name__}: {e}")
-            # Jittered backoff
-            sleep(delay + random.random() * 0.25)
-            delay = min(delay * 2, 10.0)
-    return (dst, False, "unknown")
+            _copy_once(src, dst)
+            if VALIDATE_SIZE:
+                ssz, dsz = _size_of(src), _size_of(dst)
+                if ssz >= 0 and dsz >= 0 and ssz != dsz:
+                    try:
+                        dbutils.fs.rm(dst)
+                    except Exception:
+                        pass
+                    raise IOError("size_mismatch")
+            return ("copied", dst)
+        except Exception:
+            if attempt == MAX_RETRIES:
+                return ("failed", dst)
+            sleep(delay + random.random() * 0.2)
+            delay = min(delay * 2, 6.0)
 
-def list_candidate_files(src_root: str) -> List[Tuple[str, int, str]]:
-    src_root = _norm(src_root)
+def gather_random_files():
+    root = _norm_dir(SRC_ROOT)
+    if not (root.startswith("/Volumes/") and _norm_dir(DST_ROOT).startswith("/Volumes/")):
+        raise ValueError("Use /Volumes/<catalog>/<schema>/<volume>/ paths")
+    dirs = [root]
     files = []
-    for path, size in _walk_dir(src_root):
-        rel = _rel_path(path, src_root)
-        if _include(rel):
-            files.append((path, size, rel))
-            if len(files) >= N_LIMIT:
+    dir_lists = 0
+    inflight = {}
+
+    def submit_one(ex):
+        nonlocal dir_lists
+        if not dirs or dir_lists >= MAX_DIR_LISTS:
+            return
+        i = random.randrange(len(dirs))
+        d = dirs.pop(i)
+        fut = ex.submit(dbutils.fs.ls, d)
+        inflight[fut] = d
+        dir_lists += 1
+
+    with ThreadPoolExecutor(max_workers=MAX_LIST_WORKERS) as ex:
+        for _ in range(min(MAX_LIST_WORKERS, len(dirs))):
+            submit_one(ex)
+        while inflight and len(files) < TARGET_COUNT:
+            done, _ = wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            for fut in done:
+                inflight.pop(fut, None)
+                try:
+                    entries = fut.result()
+                except Exception:
+                    entries = []
+                random.shuffle(entries)
+                for info in entries:
+                    if len(files) >= TARGET_COUNT:
+                        break
+                    if info.path.endswith("/"):
+                        dirs.append(info.path)
+                    else:
+                        rel = _rel(info.path, root)
+                        files.append((info.path, rel))
+                if len(files) >= TARGET_COUNT:
+                    break
+                if dirs and dir_lists < MAX_DIR_LISTS:
+                    submit_one(ex)
+            if not inflight and dirs and len(files) < TARGET_COUNT and dir_lists < MAX_DIR_LISTS:
+                for _ in range(min(MAX_LIST_WORKERS, len(dirs))):
+                    submit_one(ex)
+            if not inflight and not dirs:
                 break
-    return files
+    return files[:TARGET_COUNT]
 
-def copy_files(src_root: str, dst_root: str) -> None:
-    src_root = _norm(src_root)
-    dst_root = _norm(dst_root)
-    if not src_root.startswith("/Volumes/") or not dst_root.startswith("/Volumes/"):
-        raise ValueError("Use Unity Catalog Volume paths under /Volumes/<catalog>/<schema>/<volume>/")
-    candidates = list_candidate_files(src_root)
+def copy_random_files():
+    candidates = gather_random_files()
     if not candidates:
-        print("No files matched.")
+        print("No files selected")
         return
-    print(f"Planning to copy {len(candidates)} files (limit={N_LIMIT}).")
-
+    print(f"Selected {len(candidates)} files")
+    mkdir_cache = set()
+    cache_lock = Lock()
     results = {"copied": 0, "skipped_exists": 0, "failed": 0}
     failures = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = []
-        for src, _, rel in candidates:
-            dst = _dst_path(dst_root, rel)
-            futs.append(ex.submit(_copy_with_retries, src, dst, OVERWRITE, MAX_RETRIES))
+    with ThreadPoolExecutor(max_workers=MAX_COPY_WORKERS) as ex:
+        futs = [ex.submit(_copy_with_retries, src, _dst_for(rel), mkdir_cache, cache_lock) for (src, rel) in candidates]
         for f in as_completed(futs):
-            dst, ok, msg = f.result()
-            if ok and msg == "copied":
+            status, path = f.result()
+            if status == "copied":
                 results["copied"] += 1
-            elif ok and msg == "skipped_exists":
+            elif status == "skipped_exists":
                 results["skipped_exists"] += 1
             else:
                 results["failed"] += 1
-                failures.append((dst, msg))
+                failures.append(path)
 
-    print(f"Done. Copied={results['copied']}, Skipped={results['skipped_exists']}, Failed={results['failed']}")
+    print(f"Copied={results['copied']} Skipped={results['skipped_exists']} Failed={results['failed']}")
     if failures:
-        print("Failures (sample up to 20):")
-        for p, m in failures[:20]:
-            print(f"- {p}: {m}")
+        print("Failures (up to 20):")
+        for p in failures[:20]:
+            print(p)
 
-# ---- RUN ----
-# Set the config above, then execute:
-copy_files(SRC_ROOT, DST_ROOT)
+copy_random_files()
 
