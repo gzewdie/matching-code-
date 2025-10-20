@@ -1,51 +1,13 @@
-import time, posixpath, random
-
-SRC_ROOT = "/Volumes/<catalog>/<schema>/<src_volume>/"
-DST_ROOT = "/Volumes/<catalog>/<schema>/<dst_volume>/"
-random.seed(1)
-
-def _norm(p): return p if p.endswith("/") else p + "/"
-
-t0=time.time()
-src_entries = dbutils.fs.ls(_norm(SRC_ROOT))
-t1=time.time()
-print(f"ls(SRC_ROOT) -> {len(src_entries)} entries in {t1-t0:.2f}s")
-
-files = [e for e in src_entries if not e.path.endswith("/")]
-if not files:
-    raise RuntimeError("No files in SRC_ROOT")
-
-# write probe
-probe_dir = posixpath.join(_norm(DST_ROOT), "__probe__")
-probe_file = posixpath.join(probe_dir, "ok.txt")
-try:
-    dbutils.fs.mkdirs(probe_dir)
-    dbutils.fs.put(probe_file, "ok", True)
-    print("DST write probe: OK")
-    dbutils.fs.rm(probe_dir, True)
-except Exception as e:
-    raise RuntimeError(f"DST write probe failed: {e}")
-
-# single file move probe (copy+delete)
-src_one = random.choice(files).path
-dst_one = posixpath.join(_norm(DST_ROOT), posixpath.basename(src_one))
-t0=time.time()
-dbutils.fs.cp(src_one, dst_one)
-dbutils.fs.rm(src_one)
-t1=time.time()
-print(f"Single move (cp+rm) success in {t1-t0:.2f}s: {dst_one}")
-
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
-from time import sleep, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from time import sleep
 from threading import Lock
 import posixpath, random
 
 SRC_ROOT = "/Volumes/<catalog>/<schema>/<src_volume>/"
 DST_ROOT = "/Volumes/<catalog>/<schema>/<dst_volume>/"
 TARGET_COUNT = 1000
-MOVE_WORKERS = 64
+MAX_MOVE_WORKERS = 64
 MAX_RETRIES = 3
-PER_FILE_TIMEOUT_SEC = 120
 OVERWRITE = True
 VALIDATE_SIZE = True
 RANDOM_SEED = 42
@@ -53,30 +15,41 @@ RANDOM_SEED = 42
 if RANDOM_SEED is not None:
     random.seed(RANDOM_SEED)
 
-def _norm_dir(p): return p if p.endswith("/") else p + "/"
-def _parent(p): return posixpath.dirname(p.rstrip("/"))
+def _norm_dir(p):
+    p = p.replace("\\", "/")
+    return p if p.endswith("/") else p + "/"
+
+def _parent_dir(p):
+    return posixpath.dirname(p.rstrip("/"))
+
+def _mkdirs(p):
+    dbutils.fs.mkdirs(p)
 
 def _exists(path):
-    try: dbutils.fs.ls(path); return True
-    except Exception: return False
-
-def _mkdirs(path): dbutils.fs.mkdirs(path)
+    try:
+        dbutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
 
 def _size_of(path):
     try:
         info = dbutils.fs.ls(path)
-        if len(info)==1 and not info[0].path.endswith("/"):
+        if len(info) == 1 and not info[0].path.endswith("/"):
             return info[0].size
     except Exception:
         pass
     return -1
 
-def _cp(src, dst): dbutils.fs.cp(src, dst, recurse=False)
-def _rm(path): dbutils.fs.rm(path, recurse=False)
+def _cp(src, dst):
+    dbutils.fs.cp(src, dst, recurse=False)
 
-def _move_cp_rm(src, dst, mkdir_cache, lock):
-    dparent = _parent(dst)
-    with lock:
+def _rm(path):
+    dbutils.fs.rm(path, recurse=False)
+
+def _move_cp_rm(src, dst, mkdir_cache, cache_lock):
+    dparent = _parent_dir(dst)
+    with cache_lock:
         if dparent not in mkdir_cache:
             _mkdirs(dparent)
             mkdir_cache.add(dparent)
@@ -86,10 +59,8 @@ def _move_cp_rm(src, dst, mkdir_cache, lock):
                 except Exception: pass
             else:
                 return ("skipped_exists", dst)
-
     delay = 0.25
     for attempt in range(MAX_RETRIES + 1):
-        start = time()
         try:
             _cp(src, dst)
             if VALIDATE_SIZE:
@@ -101,39 +72,63 @@ def _move_cp_rm(src, dst, mkdir_cache, lock):
             _rm(src)
             return ("moved", dst)
         except Exception:
-            if time() - start > PER_FILE_TIMEOUT_SEC or attempt == MAX_RETRIES:
+            if attempt == MAX_RETRIES:
                 return ("failed", dst)
-            sleep(delay + random.random()*0.2)
-            delay = min(delay*2, 6.0)
+            sleep(delay + random.random() * 0.2)
+            delay = min(delay * 2, 6.0)
 
-def move_random_flat():
+def _sample_paths_fast(src_root, target, seed):
+    src = _norm_dir(src_root)
+    df = (spark.read.format("binaryFile")
+          .option("recursiveFileLookup", "false")
+          .load(src)
+          .select("path", "length"))
+    fraction = 0.002
+    got = []
+    for _ in range(6):
+        sample = df.sample(False, fraction, seed).limit(max(1, target - len(got)))
+        rows = sample.collect()
+        if not rows and fraction < 0.5:
+            fraction *= 2
+            continue
+        got.extend(rows)
+        if len(got) >= target:
+            break
+        fraction = min(fraction * 2, 0.5)
+    if len(got) < target:
+        more = df.limit(max(0, target - len(got))).collect()
+        got.extend(more)
+    paths = [r["path"] for r in got[:target]]
+    random.shuffle(paths)
+    return paths
+
+def move_random_fast():
     src = _norm_dir(SRC_ROOT); dst = _norm_dir(DST_ROOT)
-    entries = [e for e in dbutils.fs.ls(src) if not e.path.endswith("/")]
-    if not entries:
-        print("No files to move"); return
-    if len(entries) > TARGET_COUNT:
-        entries = random.sample(entries, TARGET_COUNT)
-    pairs = [(e.path, posixpath.join(dst, posixpath.basename(e.path))) for e in entries]
-
-    mkdir_cache, lock = set([dst.rstrip("/")]), Lock()
+    if not (src.startswith("/Volumes/") and dst.startswith("/Volumes/")):
+        raise ValueError("Use /Volumes/<catalog>/<schema>/<volume>/ paths")
+    paths = _sample_paths_fast(src, TARGET_COUNT, RANDOM_SEED or random.randint(1, 10_000_000))
+    if not paths:
+        print("No files found"); return
+    _mkdirs(dst)
+    mkdir_cache, cache_lock = set([dst.rstrip("/")]), Lock()
     moved = skipped = failed = 0
-    printed = 0
+    failures = []
+    with ThreadPoolExecutor(max_workers=MAX_MOVE_WORKERS) as ex:
+        futs = [ex.submit(_move_cp_rm, p, posixpath.join(dst, posixpath.basename(p)), mkdir_cache, cache_lock) for p in paths]
+        for f in as_completed(futs):
+            st, path = f.result()
+            if st == "moved":
+                moved += 1
+            elif st == "skipped_exists":
+                skipped += 1
+            else:
+                failed += 1
+                failures.append(path)
+    print(f"Moved={moved} Skipped={skipped} Failed={failed}")
+    if failures:
+        print("Failures (up to 20):")
+        for p in failures[:20]:
+            print(p)
 
-    with ThreadPoolExecutor(max_workers=MOVE_WORKERS) as ex:
-        futs = [ex.submit(_move_cp_rm, s, d, mkdir_cache, lock) for (s, d) in pairs]
-        for i, f in enumerate(as_completed(futs), 1):
-            try:
-                st, p = f.result(timeout=PER_FILE_TIMEOUT_SEC + 5)
-            except TimeoutError:
-                st, p = ("failed", "<timeout>")
-            if st == "moved": moved += 1
-            elif st == "skipped_exists": skipped += 1
-            else: failed += 1
-            if i - printed >= 25 or i == len(futs):
-                printed = i
-                print(f"Progress: {i}/{len(futs)} | moved={moved} skipped={skipped} failed={failed}")
-
-    print(f"Done: moved={moved} skipped={skipped} failed={failed}")
-
-move_random_flat()
+move_random_fast()
 
