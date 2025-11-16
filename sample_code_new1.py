@@ -1,6 +1,7 @@
-# receipts_to_invoices_llm_partitioned_fast_email_company_shared_safe.py
+# receipts_to_invoices_llm_partitioned_fast_shared_safe_fixed.py
 from __future__ import annotations
-import os, json, math, time, threading
+
+import os, json, math, time, threading, decimal, datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,17 +26,19 @@ class BlockingConfig:
     max_candidates_per_receipt: int = 200
     exact_abs_tolerance: float = 0.01  # dollars
 
+
 @dataclass
 class LLMConfig:
     endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
     api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
     deployment: str = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4.1")
     temperature: float = 0.0
-    max_workers: int = 24
-    max_concurrent_calls: int = 12
+    max_workers: int = 24              # parallel receipts
+    max_concurrent_calls: int = 12     # in-flight LLM calls
     max_retries: int = 4
     backoff: float = 1.6
-    adaptive_llm_threshold: int = 3
+    adaptive_llm_threshold: int = 3    # <=N candidates → use heuristic instead of LLM
+
 
 @dataclass
 class FlowConfig:
@@ -49,6 +52,7 @@ class FlowConfig:
     debug_metrics: bool = False
 
 
+# Columns to feed the matcher (we still return ALL columns later)
 RECEIPT_MATCH_COLS = [
     "receipt_id","check_num","amount","receipt_date","remarks","micr_routing","micr_acct",
     "unapplied_amount","payer_account_id",
@@ -70,14 +74,15 @@ INVOICE_MATCH_COLS = [
 ]
 
 
-# ---- Azure OpenAI client via Entra ID ----
+# ==============================
+# Utilities
+# ==============================
 def _azure_oai_client(endpoint: str, api_version: str) -> AzureOpenAI:
     if not endpoint:
         raise RuntimeError("AZURE_OPENAI_ENDPOINT is required")
     cred = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(cred, "https://cognitiveservices.azure.com/.default")
     return AzureOpenAI(api_version=api_version, azure_endpoint=endpoint, azure_ad_token_provider=token_provider)
-
 
 def _s(x: Any) -> str:
     return "" if x is None else str(x)
@@ -95,8 +100,28 @@ def _df_is_empty(df: DataFrame) -> bool:
     # Shared clusters forbid df.rdd.*; use limit(1).count()
     return df.limit(1).count() == 0
 
+def _jsonify(obj):
+    """Convert nested dict/list/Row-like structures (Decimal, date, Row) to JSON-serializable types."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, decimal.Decimal):
+        try: return float(obj)
+        except Exception: return str(obj)
+    if isinstance(obj, (datetime.date, datetime.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {str(k): _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    try:
+        return _jsonify(obj.asDict(recursive=True))  # Spark Row
+    except Exception:
+        return str(obj)
 
-# ---- LLM edge scorer ----
+
+# ==============================
+# LLM edge scorer
+# ==============================
 _global_llm_sem: Optional[threading.Semaphore] = None
 
 class LLMEdgeScorer:
@@ -109,9 +134,10 @@ class LLMEdgeScorer:
         self._sem = _global_llm_sem
 
     def _call_llm(self, payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        payload_clean = _jsonify(payload)
         msgs = [
             {"role": "system", "content": "You are a precise financial matcher. Respond with STRICT JSON only."},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            {"role": "user", "content": json.dumps(payload_clean, ensure_ascii=False)}
         ]
         last = None
         for a in range(self.cfg.max_retries):
@@ -131,6 +157,7 @@ class LLMEdgeScorer:
         return {}
 
     def score_one(self, receipt_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        # Heuristic shortcut for small candidate sets
         if len(candidates) <= self.cfg.adaptive_llm_threshold:
             out = {}
             for c in candidates:
@@ -154,7 +181,7 @@ class LLMEdgeScorer:
             "CANDIDATES": candidates,
             "TASK": ("For each candidate invoice, return: invoice_key -> "
                      "{llm_score:[0,1], matching_explanation:<=140 chars}. "
-                     "Consider amount fit (including 1-to-many), currency, date proximity "
+                     "Consider amount fit (including possible one-to-many), currency, date proximity "
                      "(receipt_date vs invoice created_on/modified_on/invdate), "
                      "created_by/modified_by similarity, payer name vs email-domain company, "
                      "check/MICR/PO hints.")
@@ -173,7 +200,9 @@ class LLMEdgeScorer:
         return out
 
 
-# ---- Main reconciler ----
+# ==============================
+# Main reconciler
+# ==============================
 class ReceiptsToInvoicesLLMPartitioned:
     def __init__(self, spark,
                  block_cfg: BlockingConfig = BlockingConfig(),
@@ -196,6 +225,7 @@ class ReceiptsToInvoicesLLMPartitioned:
                 )
 
     def _normalize_invoices(self, df: DataFrame) -> DataFrame:
+        # infer company from email domain (flexfield6)
         email = F.upper(F.col("flexfield6"))
         domain = F.regexp_extract(email, r"@([A-Z0-9.\-]+)", 1)
         main_domain = F.split(domain, r"\.")[F.size(F.split(domain, r"\.")) - 2]
@@ -245,55 +275,53 @@ class ReceiptsToInvoicesLLMPartitioned:
         return exact, r_left
 
     def _block(self, r: DataFrame, i: DataFrame,
-           r_cols_all: List[str], i_cols_all: List[str]) -> DataFrame:
-    j = (r.alias("r").join(i.alias("i"),
-                           on=(F.col("r.norm_custno")==F.col("i.norm_custno")),
-                           how="inner"))
+               r_cols_all: List[str], i_cols_all: List[str]) -> DataFrame:
+        j = (r.alias("r").join(i.alias("i"),
+                               on=(F.col("r.norm_custno")==F.col("i.norm_custno")),
+                               how="inner"))
 
-    if self.block_cfg.date_window_days > 0:
-        j = j.where(F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date"))) <= self.block_cfg.date_window_days)
+        if self.block_cfg.date_window_days > 0:
+            j = j.where(F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date"))) <= self.block_cfg.date_window_days)
 
-    if self.block_cfg.currency_required:
-        j = j.where((F.col("r.norm_currency")==F.col("i.norm_currency")) |
-                    F.col("r.norm_currency").isNull() | F.col("i.norm_currency").isNull())
+        if self.block_cfg.currency_required:
+            j = j.where((F.col("r.norm_currency")==F.col("i.norm_currency")) |
+                        F.col("r.norm_currency").isNull() | F.col("i.norm_currency").isNull())
 
-    lo = F.col("r.norm_amount") * self.block_cfg.amount_lower_multiplier
-    hi = F.col("r.norm_amount") * self.block_cfg.amount_upper_multiplier
-    j = j.where((F.col("i.norm_amount") >= lo) & (F.col("i.norm_amount") <= hi))
+        lo = F.col("r.norm_amount") * self.block_cfg.amount_lower_multiplier
+        hi = F.col("r.norm_amount") * self.block_cfg.amount_upper_multiplier
+        j = j.where((F.col("i.norm_amount") >= lo) & (F.col("i.norm_amount") <= hi))
 
-    days_diff = F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date")))
-    amount_closeness = (1.0 - (F.abs(F.col("r.norm_amount") - F.col("i.norm_amount")) /
-                               F.greatest(F.lit(1.0), F.abs(F.col("r.norm_amount"))))).cast("double")
-    user_match = (F.col("r.norm_user").isNotNull() & F.col("i.norm_user").isNotNull() &
-                  (F.col("r.norm_user")==F.col("i.norm_user"))).cast("int")
-    name_match = (F.length(F.col("r.norm_company"))>0) & (F.length(F.col("i.norm_company"))>0) & \
-                 (F.substring(F.col("r.norm_company"),1,8) == F.substring(F.col("i.norm_company"),1,8))
+        days_diff = F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date")))
+        amount_closeness = (1.0 - (F.abs(F.col("r.norm_amount") - F.col("i.norm_amount")) /
+                                   F.greatest(F.lit(1.0), F.abs(F.col("r.norm_amount"))))).cast("double")
+        user_match = (F.col("r.norm_user").isNotNull() & F.col("i.norm_user").isNotNull() &
+                      (F.col("r.norm_user")==F.col("i.norm_user"))).cast("int")
+        name_match = (F.length(F.col("r.norm_company"))>0) & (F.length(F.col("i.norm_company"))>0) & \
+                     (F.substring(F.col("r.norm_company"),1,8) == F.substring(F.col("i.norm_company"),1,8))
 
-    heuristic_col = (0.60*amount_closeness +
-                     0.30*(1.0 - F.least(days_diff.cast("double")/F.lit(365.0), F.lit(1.0))) +
-                     0.05*user_match +
-                     0.05*name_match.cast("int"))
+        heuristic_col = (0.60*amount_closeness +
+                         0.30*(1.0 - F.least(days_diff.cast("double")/F.lit(365.0), F.lit(1.0))) +
+                         0.05*user_match +
+                         0.05*name_match.cast("int"))
 
-    r_struct = F.struct(*[F.col(f"r.{c}").alias(c) for c in r_cols_all]).alias("r_row")
-    i_struct = F.struct(*[F.col(f"i.{c}").alias(c) for c in i_cols_all]).alias("i_row")
+        r_struct = F.struct(*[F.col(f"r.{c}").alias(c) for c in r_cols_all]).alias("r_row")
+        i_struct = F.struct(*[F.col(f"i.{c}").alias(c) for c in i_cols_all]).alias("i_row")
 
-    # First project to unqualified "receipt_id"
-    proj = (j.select(F.col("r.receipt_id").cast("string").alias("receipt_id"),
-                     r_struct, i_struct,
-                     days_diff.alias("days_diff"),
-                     amount_closeness.alias("amount_closeness"),
-                     user_match.alias("user_match"),
-                     heuristic_col.alias("heuristic")))
+        # Project unqualified receipt_id first
+        proj = (j.select(F.col("r.receipt_id").cast("string").alias("receipt_id"),
+                         r_struct, i_struct,
+                         days_diff.alias("days_diff"),
+                         amount_closeness.alias("amount_closeness"),
+                         user_match.alias("user_match"),
+                         heuristic_col.alias("heuristic")))
 
-    # Now define the window on the *projected* column name
-    w = Window.partitionBy("receipt_id").orderBy(F.col("heuristic").desc())
+        # Window on the projected name
+        w = Window.partitionBy("receipt_id").orderBy(F.col("heuristic").desc())
 
-    blocked = (proj.withColumn("rk", F.row_number().over(w))
-                    .where(F.col("rk") <= self.block_cfg.max_candidates_per_receipt)
-                    .drop("rk"))
-
-    return blocked
-
+        blocked = (proj.withColumn("rk", F.row_number().over(w))
+                        .where(F.col("rk") <= self.block_cfg.max_candidates_per_receipt)
+                        .drop("rk"))
+        return blocked
 
     def _llm_score_partition_group(self, rows: List[Row]) -> List[Dict[str, Any]]:
         r = rows[0]["r_row"].asDict()
@@ -334,7 +362,6 @@ class ReceiptsToInvoicesLLMPartitioned:
 
     def _solve_partition(self, blocked_part: DataFrame) -> DataFrame:
         if _df_is_empty(blocked_part):
-            # empty typed frame
             return self.spark.createDataFrame([], schema=T.StructType([
                 T.StructField("receipt_id", T.StringType(), False),
                 T.StructField("invoice_key", T.StringType(), False),
@@ -382,7 +409,7 @@ class ReceiptsToInvoicesLLMPartitioned:
                     .join(scored_df, on=["receipt_id","invoice_key"], how="left")
                     .fillna({"llm_score":0.0,"matching_explanation":""}))
 
-        # Flow graph on driver
+        # Build min-cost flow on driver
         scale = self.flow_cfg.cents_scale
         G = nx.DiGraph()
         total_supply = 0
@@ -414,7 +441,7 @@ class ReceiptsToInvoicesLLMPartitioned:
 
         _, flow = nx.network_simplex(G)
 
-        # prefer best llm score per (receipt, invoice)
+        # Prefer best llm score/explanation per (receipt, invoice)
         best = {}
         for row in joined.select("receipt_id","invoice_key","llm_score","matching_explanation").collect():
             k = (row["receipt_id"], row["invoice_key"])
@@ -492,7 +519,7 @@ class ReceiptsToInvoicesLLMPartitioned:
                    .join(i_pref, combined.invoice_key==i_pref.ikey_join, "left")
                    .drop("rid_join","ikey_join"))
 
-        # add unmatched receipts (no rows)
+        # add unmatched receipts
         all_r = df_receipts.select(F.col("receipt_id").cast("string").alias("rid_all")).distinct()
         seen = matched.select("receipt_id").distinct()
         missing = all_r.join(seen, all_r.rid_all==seen.receipt_id, "left_anti") \
@@ -518,7 +545,7 @@ class ReceiptsToInvoicesLLMPartitioned:
 
 
 # ==============================
-# Example (Databricks)
+# Example usage on Databricks
 # ==============================
 # matcher = ReceiptsToInvoicesLLMPartitioned(
 #     spark,
