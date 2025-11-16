@@ -245,49 +245,55 @@ class ReceiptsToInvoicesLLMPartitioned:
         return exact, r_left
 
     def _block(self, r: DataFrame, i: DataFrame,
-               r_cols_all: List[str], i_cols_all: List[str]) -> DataFrame:
-        j = (r.alias("r").join(i.alias("i"),
-                               on=(F.col("r.norm_custno")==F.col("i.norm_custno")),
-                               how="inner"))
+           r_cols_all: List[str], i_cols_all: List[str]) -> DataFrame:
+    j = (r.alias("r").join(i.alias("i"),
+                           on=(F.col("r.norm_custno")==F.col("i.norm_custno")),
+                           how="inner"))
 
-        if self.block_cfg.date_window_days > 0:
-            j = j.where(F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date"))) <= self.block_cfg.date_window_days)
+    if self.block_cfg.date_window_days > 0:
+        j = j.where(F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date"))) <= self.block_cfg.date_window_days)
 
-        if self.block_cfg.currency_required:
-            j = j.where((F.col("r.norm_currency")==F.col("i.norm_currency")) |
-                        F.col("r.norm_currency").isNull() | F.col("i.norm_currency").isNull())
+    if self.block_cfg.currency_required:
+        j = j.where((F.col("r.norm_currency")==F.col("i.norm_currency")) |
+                    F.col("r.norm_currency").isNull() | F.col("i.norm_currency").isNull())
 
-        lo = F.col("r.norm_amount") * self.block_cfg.amount_lower_multiplier
-        hi = F.col("r.norm_amount") * self.block_cfg.amount_upper_multiplier
-        j = j.where((F.col("i.norm_amount") >= lo) & (F.col("i.norm_amount") <= hi))
+    lo = F.col("r.norm_amount") * self.block_cfg.amount_lower_multiplier
+    hi = F.col("r.norm_amount") * self.block_cfg.amount_upper_multiplier
+    j = j.where((F.col("i.norm_amount") >= lo) & (F.col("i.norm_amount") <= hi))
 
-        days_diff = F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date")))
-        amount_closeness = (1.0 - (F.abs(F.col("r.norm_amount") - F.col("i.norm_amount")) /
-                                   F.greatest(F.lit(1.0), F.abs(F.col("r.norm_amount"))))).cast("double")
-        user_match = (F.col("r.norm_user").isNotNull() & F.col("i.norm_user").isNotNull() &
-                      (F.col("r.norm_user")==F.col("i.norm_user"))).cast("int")
-        name_match = (F.length(F.col("r.norm_company"))>0) & (F.length(F.col("i.norm_company"))>0) & \
-                     (F.substring(F.col("r.norm_company"),1,8) == F.substring(F.col("i.norm_company"),1,8))
+    days_diff = F.abs(F.datediff(F.col("r.norm_date"), F.col("i.norm_date")))
+    amount_closeness = (1.0 - (F.abs(F.col("r.norm_amount") - F.col("i.norm_amount")) /
+                               F.greatest(F.lit(1.0), F.abs(F.col("r.norm_amount"))))).cast("double")
+    user_match = (F.col("r.norm_user").isNotNull() & F.col("i.norm_user").isNotNull() &
+                  (F.col("r.norm_user")==F.col("i.norm_user"))).cast("int")
+    name_match = (F.length(F.col("r.norm_company"))>0) & (F.length(F.col("i.norm_company"))>0) & \
+                 (F.substring(F.col("r.norm_company"),1,8) == F.substring(F.col("i.norm_company"),1,8))
 
-        heuristic = (0.60*amount_closeness +
+    heuristic_col = (0.60*amount_closeness +
                      0.30*(1.0 - F.least(days_diff.cast("double")/F.lit(365.0), F.lit(1.0))) +
                      0.05*user_match +
-                     0.05*name_match.cast("int")).alias("heuristic")
+                     0.05*name_match.cast("int"))
 
-        r_struct = F.struct(*[F.col(f"r.{c}").alias(c) for c in r_cols_all]).alias("r_row")
-        i_struct = F.struct(*[F.col(f"i.{c}").alias(c) for c in i_cols_all]).alias("i_row")
+    r_struct = F.struct(*[F.col(f"r.{c}").alias(c) for c in r_cols_all]).alias("r_row")
+    i_struct = F.struct(*[F.col(f"i.{c}").alias(c) for c in i_cols_all]).alias("i_row")
 
-        w = Window.partitionBy("r.receipt_id").orderBy(F.col("heuristic").desc())
-        blocked = (j.select(F.col("r.receipt_id").cast("string").alias("receipt_id"),
-                            r_struct, i_struct,
-                            days_diff.alias("days_diff"),
-                            amount_closeness.alias("amount_closeness"),
-                            user_match.alias("user_match"),
-                            heuristic)
-                     .withColumn("rk", F.row_number().over(w))
-                     .where(F.col("rk") <= self.block_cfg.max_candidates_per_receipt)
-                     .drop("rk"))
-        return blocked
+    # First project to unqualified "receipt_id"
+    proj = (j.select(F.col("r.receipt_id").cast("string").alias("receipt_id"),
+                     r_struct, i_struct,
+                     days_diff.alias("days_diff"),
+                     amount_closeness.alias("amount_closeness"),
+                     user_match.alias("user_match"),
+                     heuristic_col.alias("heuristic")))
+
+    # Now define the window on the *projected* column name
+    w = Window.partitionBy("receipt_id").orderBy(F.col("heuristic").desc())
+
+    blocked = (proj.withColumn("rk", F.row_number().over(w))
+                    .where(F.col("rk") <= self.block_cfg.max_candidates_per_receipt)
+                    .drop("rk"))
+
+    return blocked
+
 
     def _llm_score_partition_group(self, rows: List[Row]) -> List[Dict[str, Any]]:
         r = rows[0]["r_row"].asDict()
