@@ -1,335 +1,213 @@
-import os, json
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 
-from pyspark.sql import functions as F, Window as W, types as T
-from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-
-
-_JUDGE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "Decide if receipt and remittance refer to the same payer/payment. "
-     "Names may be abbreviated/typo. Addresses may be partial or null. "
-     "Amount/date consistency matters most. Return STRICT JSON only."),
-    ("user",
-     "Receipt: amount={r_amount} date={r_date} payer={r_payer} address={r_addr}\n"
-     "Remittance: matched_amount_field={m_amount_src} amount={m_amount_val} date={m_date} payer={m_payer} address={m_addr}\n"
-     "Diffs: amt_diff_cents={amt_diff} day_diff_days={day_diff} pre_score={pre_score}\n"
-     "Return JSON ONLY: {\"is_match\": true, \"confidence\": 0.0, \"reason\": \"short\"}")
-])
-
-def _lc_client(AOAI_ENDPOINT, AOAI_API_VERSION, AOAI_DEPLOYMENT, DRIVER_TOKEN_VALUE):
-    return AzureChatOpenAI(
-        azure_endpoint=AOAI_ENDPOINT,
-        api_version=AOAI_API_VERSION,
-        azure_deployment=AOAI_DEPLOYMENT,
-        azure_ad_token_provider=lambda: DRIVER_TOKEN_VALUE,
-        temperature=0.0,
-    )
-
-def _safe_json(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        i, j = s.find("{"), s.rfind("}")
-        if i >= 0 and j > i:
-            try:
-                return json.loads(s[i:j+1])
-            except Exception:
-                pass
-    return {"is_match": False, "confidence": 0.0, "reason": "unparseable"}
-
-def llm_judge_matches(
-    df_to_judge,
+def match_receipts_to_invoices(
+    df_receipts_: DataFrame,
+    df_invoices: DataFrame,
     *,
-    AOAI_ENDPOINT,
-    AOAI_API_VERSION,
-    AOAI_DEPLOYMENT,
-    DRIVER_TOKEN_VALUE,
-    max_workers=8,
-):
-    schema = T.StructType([
-        T.StructField("receipt_id", T.StringType(), False),
-        T.StructField("document_id", T.StringType(), False),
-        T.StructField("remitreceipt_id", T.StringType(), False),
-        T.StructField("llm_is_match", T.BooleanType(), True),
-        T.StructField("llm_confidence", T.DoubleType(), True),
-        T.StructField("llm_reason", T.StringType(), True),
-    ])
-
-    def _partition(it):
-        client = _lc_client(AOAI_ENDPOINT, AOAI_API_VERSION, AOAI_DEPLOYMENT, DRIVER_TOKEN_VALUE)
-
-        def _one(r):
-            msgs = _JUDGE_PROMPT.format_prompt(
-                r_amount=r["r_amount"], r_date=r["r_date"], r_payer=r["r_payer"], r_addr=r["r_addr"],
-                m_amount_src=r["matched_amount_field"], m_amount_val=r["m_amount_val"],
-                m_date=r["m_date"], m_payer=r["m_payer"], m_addr=r["m_addr"],
-                amt_diff=r["amt_diff"], day_diff=r["day_diff"], pre_score=r["pre_score"]
-            ).to_messages()
-            j = _safe_json(client.invoke(msgs).content)
-            return {
-                "receipt_id": r["receipt_id"],
-                "document_id": r["document_id"],
-                "remitreceipt_id": r["remitreceipt_id"],
-                "llm_is_match": bool(j.get("is_match", False)),
-                "llm_confidence": float(j.get("confidence", 0.0) or 0.0),
-                "llm_reason": (j.get("reason") or "")[:2000],
-            }
-
-        for pdf in it:
-            rows = pdf.to_dict("records")
-            out = []
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [ex.submit(_one, r) for r in rows]
-                for f in as_completed(futs):
-                    out.append(f.result())
-            yield pd.DataFrame(out)
-
-    return df_to_judge.mapInPandas(_partition, schema=schema)
-
-
-def match_receipts_to_remittances_detail(
-    df_receipts,
-    df_remittances,
-    *,
-    AOAI_ENDPOINT,
-    AOAI_API_VERSION,
-    AOAI_DEPLOYMENT,
-    DRIVER_TOKEN_VALUE,
     receipt_id_col="receipt_id",
-    remit_doc_id_col="document_id",
-    remit_receipt_id_col="remitreceipt_id",
-    amt_bucket_cents=500,
-    amt_tol_pct=0.0,              # <-- NEW: e.g., 0.01 for ±1%
-    amt_tol_cents_min=0,          # optional floor in cents (keep 0 if you want pure %)
-    date_window_days=14,
-    week_bucket_radius=2,
-    topk_per_receipt=30,
-    max_matches_per_receipt=3,
-    high_t=0.92,
-    secondary_t=0.88,
-    margin=0.02,
-    use_llm=True,
-    llm_partitions=64,
-    llm_workers_per_task=8,
-):
-    def _norm(c):
-        s = F.lower(F.trim(F.coalesce(F.col(c).cast("string"), F.lit(""))))
-        s = F.regexp_replace(s, r"[^a-z0-9 ]", " ")
-        s = F.regexp_replace(s, r"\s+", " ")
-        s = F.regexp_replace(s, r"\b(inc|llc|ltd|corp|co|company|incorporated|limited|corporation)\b", "")
-        return F.trim(F.regexp_replace(s, r"\s+", " "))
+    receipt_amt_col="amount",
+    receipt_date_col="receipt_date",
+    receipt_cust_col="payercust_custno",
+    inv_cust_col="custno",
+    inv_no_col="invno",
+    invdate_col="invdate",
+    created_on_col="created_on",
+    modified_on_col="modified_on",
+    app_date_col="app_date",     # invoices only
+    due_date_col="duedate",      # invoices only
+    months_back_stage1=12,
+    months_fwd_stage1=1,
+    months_back_stage2=24,
+    months_fwd_stage2=2,
+    time_window_hours_stage2=12,   # only if receipts have created_on
+    amount_tol=0.01,
+) -> DataFrame:
+    def has(df: DataFrame, c: str) -> bool: return c in df.columns
+    def pref(df: DataFrame, p: str) -> DataFrame: return df.select([F.col(c).alias(p + c) for c in df.columns])
 
-    def _sim(a, b):
-        denom = F.greatest(F.length(a), F.length(b), F.lit(1))
-        return (F.lit(1.0) - (F.levenshtein(a, b) / denom))
+    r = pref(df_receipts_, "recpt_")
+    i = pref(df_invoices, "inv_")
 
-    epoch = F.lit("1970-01-01")
-    pct = F.lit(float(amt_tol_pct))
-    tol_floor = F.lit(int(amt_tol_cents_min))
-    bucket = F.lit(int(amt_bucket_cents))
+    RID, RCUST = f"recpt_{receipt_id_col}", f"recpt_{receipt_cust_col}"
+    RAMT, RDATE = f"recpt_{receipt_amt_col}", f"recpt_{receipt_date_col}"
 
-    # receipts header
-    r0 = (df_receipts.select(
-            F.col(receipt_id_col).alias("receipt_id"),
-            F.col("amount").alias("r_amount"),
-            F.col("receipt_date").alias("r_date_raw"),
-            F.col("payercust_company").alias("r_payer"),
-            F.col("full_address").alias("r_addr"),
+    ICUST = f"inv_{inv_cust_col}"
+    INO   = f"inv_{inv_no_col}" if has(i, f"inv_{inv_no_col}") else None
+    IINVD = f"inv_{invdate_col}"
+
+    ICRE  = f"inv_{created_on_col}"
+    IMOD  = f"inv_{modified_on_col}" if has(i, f"inv_{modified_on_col}") else ICRE
+    IAPP  = f"inv_{app_date_col}" if has(i, f"inv_{app_date_col}") else None
+    IDUE  = f"inv_{due_date_col}" if has(i, f"inv_{due_date_col}") else None
+
+    RCRE  = f"recpt_{created_on_col}"
+    use_time = has(r, RCRE)
+
+    rk = (r.select(
+            F.col(RID), F.col(RCUST),
+            F.col(RAMT).cast("double").alias("__r_amt"),
+            F.to_date(F.col(RDATE)).alias("__r_dt"),
+            *( [F.to_timestamp(F.col(RCRE)).alias("__r_ts")] if use_time else [] ),
         )
-        .withColumn("receipt_id", F.col("receipt_id").cast("string"))
-        .withColumn("r_date", F.to_date("r_date_raw"))
-        .withColumn("r_amount_cents", F.round(F.col("r_amount") * 100).cast("long"))
-        .filter(F.col("r_amount_cents").isNotNull() & F.col("r_date").isNotNull())
-        .withColumn("r_payer_norm", _norm("r_payer"))
-        .withColumn("r_addr_norm", _norm("r_addr"))
-        .withColumn("q", (F.length("r_payer_norm") > 0).cast("int") * 2
-                     + (F.length("r_addr_norm") > 0).cast("int")
-                     + F.length("r_payer_norm") * 0.001
-                     + F.length("r_addr_norm") * 0.0001)
-    )
-    wr = W.partitionBy("receipt_id").orderBy(F.desc("q"))
-    receipts_hdr = (r0.withColumn("rn", F.row_number().over(wr))
-                      .filter("rn=1").drop("rn","q")
-                      .withColumn("r_amt_bucket", F.floor(F.col("r_amount_cents")/bucket).cast("long"))
-                      .withColumn("r_week", F.floor(F.datediff(F.col("r_date"), epoch)/7).cast("int"))
-                      # per-receipt cents tolerance from percentage (plus optional floor)
-                      .withColumn("r_tol_cents",
-                                  F.greatest(tol_floor,
-                                             F.round(F.abs(F.col("r_amount_cents").cast("double")) * pct).cast("long")))
-                      # how many amount buckets we must search around r_amt_bucket
-                      .withColumn("r_tol_buckets", F.ceil(F.col("r_tol_cents").cast("double") / bucket).cast("long"))
+        .dropna(subset=[RID, RCUST, "__r_amt", "__r_dt"])
+        .dropDuplicates([RID, RCUST])
     )
 
-    # remittance header
-    m0 = (df_remittances.select(
-            F.col(remit_doc_id_col).alias("document_id"),
-            F.col(remit_receipt_id_col).alias("remitreceipt_id"),
-            F.col("total_remittance_amount").alias("m_total_remit"),
-            F.col("total_amount_paid").alias("m_total_paid"),
-            F.col("remittance_date").alias("m_date_raw"),
-            F.col("payer_name").alias("m_payer"),
-            F.col("payer_address").alias("m_addr"),
-        )
-        .withColumn("document_id", F.col("document_id").cast("string"))
-        .withColumn("remitreceipt_id", F.col("remitreceipt_id").cast("string"))
-        .withColumn("m_date", F.to_date("m_date_raw"))
-        .filter(F.col("m_date").isNotNull())
-        .withColumn("m_payer_norm", _norm("m_payer"))
-        .withColumn("m_addr_norm", _norm("m_addr"))
-        .withColumn("q", (F.length("m_payer_norm") > 0).cast("int") * 2
-                     + (F.length("m_addr_norm") > 0).cast("int")
-                     + F.length("m_payer_norm") * 0.001
-                     + F.length("m_addr_norm") * 0.0001)
+    it = (i.withColumn("__i_invdt", F.to_date(F.col(IINVD)))
+           .withColumn("__i_cts",   F.to_timestamp(F.col(ICRE)))
+           .withColumn("__i_mts",   F.to_timestamp(F.col(IMOD)))
+           .withColumn("__i_cd",    F.to_date(F.col("__i_cts")))
+           .withColumn("__i_md",    F.to_date(F.col("__i_mts")))
+           .withColumn("__i_appd",  F.to_date(F.col(IAPP)) if IAPP else F.lit(None).cast("date"))
+           .withColumn("__i_dued",  F.to_date(F.col(IDUE)) if IDUE else F.lit(None).cast("date"))
+           .dropna(subset=[ICUST, "__i_invdt", "__i_cts"])
     )
-    wm = W.partitionBy("document_id","remitreceipt_id").orderBy(F.desc("q"))
-    remit_hdr_base = (m0.withColumn("rn", F.row_number().over(wm))
-                        .filter("rn=1").drop("rn","q"))
+    if IAPP: it = it.dropna(subset=["__i_appd"])
+    if IDUE: it = it.dropna(subset=["__i_dued"])
 
-    remit_hdr = (remit_hdr_base
-        .withColumn("amt_candidates", F.array(
-            F.struct(F.lit("total_remittance_amount").alias("src"), F.col("m_total_remit").alias("val")),
-            F.struct(F.lit("total_amount_paid").alias("src"), F.col("m_total_paid").alias("val")),
-        ))
-        .withColumn("amt", F.explode("amt_candidates"))
-        .filter(F.col("amt.val").isNotNull())
-        .filter(~((F.col("amt.src") == "total_amount_paid") & (F.col("amt.val") == F.col("m_total_remit"))))
-        .withColumn("matched_amount_field", F.col("amt.src"))
-        .withColumn("m_amount_val", F.col("amt.val"))
-        .withColumn("m_amount_cents", F.round(F.col("amt.val")*100).cast("long"))
-        .filter(F.col("m_amount_cents").isNotNull())
-        .drop("amt_candidates","amt")
-        .withColumn("m_amt_bucket", F.floor(F.col("m_amount_cents")/bucket).cast("long"))
-        .withColumn("m_week", F.floor(F.datediff(F.col("m_date"), epoch)/7).cast("int"))
-    )
-
-    # candidate join: amount bucket within receipt-specific tolerance buckets + week proximity
-    cand = (receipts_hdr.alias("r")
-        .join(remit_hdr.alias("m"),
-              (F.col("m.m_amt_bucket").between(F.col("r.r_amt_bucket") - F.col("r.r_tol_buckets"),
-                                               F.col("r.r_amt_bucket") + F.col("r.r_tol_buckets"))) &
-              (F.col("r.r_week").between(F.col("m.m_week")-F.lit(week_bucket_radius),
-                                         F.col("m.m_week")+F.lit(week_bucket_radius))),
-              "inner")
-        .withColumn("amt_diff", F.abs(F.col("r.r_amount_cents") - F.col("m.m_amount_cents")))
-        .withColumn("day_diff", F.abs(F.datediff(F.col("r.r_date"), F.col("m.m_date"))))
-        # percentage tolerance filter (per receipt)
-        .filter((F.col("amt_diff") <= F.col("r.r_tol_cents")) & (F.col("day_diff") <= date_window_days))
-        .withColumn("name_sim", _sim(F.col("r.r_payer_norm"), F.col("m.m_payer_norm")))
-        .withColumn("addr_sim", F.when((F.length("r.r_addr_norm")==0) | (F.length("m.m_addr_norm")==0), F.lit(None))
-                              .otherwise(_sim(F.col("r.r_addr_norm"), F.col("m.m_addr_norm"))))
-        .withColumn("amount_score",
-                    F.when(F.col("amt_diff")==0, F.lit(1.0))
-                     .otherwise(F.exp(-F.col("amt_diff")/F.lit(500.0))))
-        .withColumn("date_score", F.exp(-F.col("day_diff")/F.lit(7.0)))
-        .withColumn("addr_sim_f", F.coalesce(F.col("addr_sim"), F.lit(0.0)))
-        .withColumn("pre_score", 0.45*F.col("amount_score") + 0.20*F.col("date_score") + 0.25*F.col("name_sim") + 0.10*F.col("addr_sim_f"))
-        .select(
-            F.col("r.receipt_id").alias("receipt_id"),
-            F.col("m.document_id").alias("document_id"),
-            F.col("m.remitreceipt_id").alias("remitreceipt_id"),
-            "matched_amount_field","m_amount_val",
-            "pre_score","amt_diff","day_diff","name_sim","addr_sim",
-            F.col("r.r_amount").alias("r_amount"), F.col("r.r_date").alias("r_date"),
-            F.col("r.r_payer").alias("r_payer"), F.col("r.r_addr").alias("r_addr"),
-            F.col("m.m_date").alias("m_date"), F.col("m.m_payer").alias("m_payer"), F.col("m.m_addr").alias("m_addr"),
-        )
-    )
-
-    # topK per receipt
-    w_topk = W.partitionBy("receipt_id").orderBy(F.desc("pre_score"))
-    topk = cand.withColumn("rank0", F.row_number().over(w_topk)).filter(F.col("rank0") <= topk_per_receipt)
-
-    # threshold band
-    w_best = W.partitionBy("receipt_id")
-    kept = (topk.withColumn("best_score", F.max("pre_score").over(w_best))
-        .filter((F.col("pre_score") >= high_t) |
-                ((F.col("pre_score") >= secondary_t) & (F.col("pre_score") >= F.col("best_score") - margin)))
-    )
-
-    # pre-cap (limits LLM calls)
-    w_pre = W.partitionBy("receipt_id").orderBy(F.desc("pre_score"))
-    pre_cap = (kept.withColumn("match_rank_pre", F.row_number().over(w_pre))
-                   .filter(F.col("match_rank_pre") <= max_matches_per_receipt))
-
-    if use_llm:
-        to_judge = (pre_cap
-            .filter((F.col("pre_score") < high_t) | (F.col("match_rank_pre") > 1))
-            .select("receipt_id","document_id","remitreceipt_id",
-                    "matched_amount_field","m_amount_val","pre_score","amt_diff","day_diff",
-                    "r_amount","r_date","r_payer","r_addr","m_date","m_payer","m_addr")
-            .dropDuplicates(["receipt_id","document_id","remitreceipt_id"])
-            .repartition(llm_partitions)
-        )
-        judged = llm_judge_matches(
-            to_judge,
-            AOAI_ENDPOINT=AOAI_ENDPOINT,
-            AOAI_API_VERSION=AOAI_API_VERSION,
-            AOAI_DEPLOYMENT=AOAI_DEPLOYMENT,
-            DRIVER_TOKEN_VALUE=DRIVER_TOKEN_VALUE,
-            max_workers=llm_workers_per_task,
-        )
-        scored = (pre_cap.join(judged, ["receipt_id","document_id","remitreceipt_id"], "left")
-            .withColumn("final_score",
-                        F.when(F.col("llm_confidence").isNull(), F.col("pre_score"))
-                         .otherwise(0.65*F.col("llm_confidence") + 0.35*F.col("pre_score")))
-            .withColumn("keep_flag",
-                        F.when(F.col("llm_confidence").isNull(), F.col("pre_score") >= high_t)
-                         .otherwise(F.col("llm_is_match") & (F.col("llm_confidence") >= 0.55)))
-        )
-    else:
-        scored = (pre_cap
-            .withColumn("llm_is_match", F.lit(None).cast("boolean"))
-            .withColumn("llm_confidence", F.lit(None).cast("double"))
-            .withColumn("llm_reason", F.lit(None).cast("string"))
-            .withColumn("final_score", F.col("pre_score"))
-            .withColumn("keep_flag", F.col("pre_score") >= high_t)
+    b = rk.agg(F.min("__r_dt").alias("mn"), F.max("__r_dt").alias("mx")).collect()[0]
+    if b["mn"] is not None and b["mx"] is not None:
+        it = it.where(
+            (F.col("__i_invdt") >= F.add_months(F.lit(b["mn"]), -months_back_stage2)) &
+            (F.col("__i_invdt") <= F.add_months(F.lit(b["mx"]),  months_fwd_stage2))
         )
 
-    # final cap to 3 per receipt_id
-    w_final = W.partitionBy("receipt_id").orderBy(F.desc("final_score"))
-    matches_hdr = (scored.filter("keep_flag")
-        .withColumn("match_rank", F.row_number().over(w_final))
-        .filter(F.col("match_rank") <= max_matches_per_receipt)
-        .select("receipt_id","document_id","remitreceipt_id","match_rank",
-                F.col("pre_score").alias("match_pre_score"),
-                F.col("final_score").alias("match_score"),
-                "matched_amount_field","amt_diff","day_diff","name_sim","addr_sim",
-                F.col("llm_confidence").alias("llm_confidence"),
-                F.col("llm_reason").alias("match_explanation"))
+    def icol(name: str):
+        c = f"inv_{name}"
+        return F.coalesce(F.col(c).cast("double"), F.lit(0.0)) if has(i, c) else F.lit(0.0)
+
+    I_AMT, I_INVAMT, I_BAL, I_APPAMT = icol("amount"), icol("invamt"), icol("balance"), icol("app_amount")
+
+    def candidates(rk_df: DataFrame, months_back: int, months_fwd: int, refine_time: bool) -> DataFrame:
+        cond = (
+            (F.col(ICUST) == F.col(RCUST)) &
+            (F.col("__i_cd") == F.col("__i_md")) &
+            (F.col("__i_invdt") >= F.add_months(F.col("__r_dt"), -months_back)) &
+            (F.col("__i_invdt") <= F.add_months(F.col("__r_dt"),  months_fwd))
+        )
+        if refine_time and use_time:
+            cond = cond & (
+                F.abs(F.unix_timestamp(F.col("__i_cts")) - F.unix_timestamp(F.col("__r_ts")))
+                <= F.lit(int(time_window_hours_stage2) * 3600)
+            )
+        return rk_df.join(it, cond, "inner")
+
+    def stage1():
+        cand = candidates(rk, months_back_stage1, months_fwd_stage1, refine_time=False)
+        agg = (cand.groupBy(RID, RCUST)
+                 .agg(
+                     F.first("__r_amt").alias("__r_amt"),
+                     F.sum(I_AMT).alias("inv_sum_amount"),
+                     F.sum(I_INVAMT).alias("inv_sum_invamt"),
+                     F.sum(I_BAL).alias("inv_sum_balance"),
+                     F.sum(I_APPAMT).alias("inv_sum_app_amount"),
+                     F.count(F.lit(1)).alias("inv_candidate_rows"),
+                     *( [F.countDistinct(F.col(INO)).alias("inv_candidate_invnos")] if INO else [] ),
+                     F.countDistinct("__i_appd").alias("__app_n"),
+                     F.countDistinct("__i_dued").alias("__due_n"),
+                     F.first("__i_appd", ignorenulls=True).alias("inv_app_date_d"),
+                     F.first("__i_dued", ignorenulls=True).alias("inv_due_date_d"),
+                 )
+                 .where((F.col("__app_n") == 1) & (F.col("__due_n") == 1))
+                 .drop("__app_n", "__due_n")
+        )
+
+        d1 = F.abs(F.col("__r_amt") - F.col("inv_sum_amount"))
+        d2 = F.abs(F.col("__r_amt") - F.col("inv_sum_invamt"))
+        d3 = F.abs(F.col("__r_amt") - F.col("inv_sum_balance"))
+        d4 = F.abs(F.col("__r_amt") - F.col("inv_sum_app_amount"))
+        best = F.least(d1, d2, d3, d4)
+        basis = (F.when(best == d1, "sum_amount")
+                  .when(best == d2, "sum_invamt")
+                  .when(best == d3, "sum_balance")
+                  .otherwise("sum_app_amount"))
+
+        keys = (agg.withColumn("match_stage", F.lit(1))
+                   .withColumn("match_basis", basis)
+                   .withColumn("match_diff", best)
+                   .where(best <= F.lit(float(amount_tol)))
+                   .drop("__r_amt")
+        )
+        detail = cand.join(keys, [RID, RCUST], "inner")
+        return keys.select(RID, RCUST), detail
+
+    def stage2(mk1: DataFrame):
+        r_un = rk.join(mk1, [RID, RCUST], "left_anti")
+        cand0 = candidates(r_un, months_back_stage2, months_fwd_stage2, refine_time=True)
+
+        cons = (cand0.groupBy(RID, RCUST)
+                    .agg(F.countDistinct("__i_appd").alias("app_n"),
+                         F.countDistinct("__i_dued").alias("due_n"))
+                    .where((F.col("app_n") == 1) & (F.col("due_n") == 1))
+                    .select(RID, RCUST)
+        )
+        cand = cand0.join(cons, [RID, RCUST], "inner")
+
+        cstats = (cand.groupBy(RID, RCUST)
+                    .agg(
+                        F.sum(I_AMT).alias("inv_sum_amount"),
+                        F.sum(I_INVAMT).alias("inv_sum_invamt"),
+                        F.sum(I_BAL).alias("inv_sum_balance"),
+                        F.sum(I_APPAMT).alias("inv_sum_app_amount"),
+                        F.count(F.lit(1)).alias("inv_candidate_rows"),
+                        *( [F.countDistinct(F.col(INO)).alias("inv_candidate_invnos")] if INO else [] ),
+                        F.first("__i_appd", ignorenulls=True).alias("inv_app_date_d"),
+                        F.first("__i_dued", ignorenulls=True).alias("inv_due_date_d"),
+                    )
+        )
+
+        w = Window.partitionBy(RID, RCUST).orderBy(
+            F.col("__i_invdt").desc(), F.col("__i_cts").desc(), *( [F.col(INO).asc()] if INO else [] )
+        )
+
+        def greedy(bname: str, bexpr):
+            run = F.sum(bexpr).over(w)
+            chosen = cand.withColumn("__run", run).where(run <= (F.col("__r_amt") + F.lit(float(amount_tol))))
+            keys = (chosen.groupBy(RID, RCUST)
+                          .agg(F.first("__r_amt").alias("__r_amt"),
+                               F.max("__run").alias("inv_greedy_sum"),
+                               F.count(F.lit(1)).alias("inv_greedy_rows"))
+                          .withColumn("match_stage", F.lit(2))
+                          .withColumn("match_basis", F.lit(f"greedy_{bname}"))
+                          .withColumn("match_diff", F.abs(F.col("__r_amt") - F.col("inv_greedy_sum")))
+                          .where(F.col("match_diff") <= F.lit(float(amount_tol)))
+                          .drop("__r_amt")
+            ).join(cstats, [RID, RCUST], "left")
+
+            detail = (chosen.join(keys.select(RID, RCUST, "match_stage", "match_basis", "match_diff",
+                                              "inv_greedy_sum", "inv_greedy_rows",
+                                              "inv_sum_amount", "inv_sum_invamt", "inv_sum_balance", "inv_sum_app_amount",
+                                              "inv_candidate_rows", *([ "inv_candidate_invnos" ] if INO else []),
+                                              "inv_app_date_d", "inv_due_date_d"),
+                                  [RID, RCUST], "inner")
+                            .withColumn("__selected_amount_field", F.lit(bname))
+            )
+            return keys.select(RID, RCUST, "match_basis", "match_diff"), detail
+
+        k1, d1 = greedy("amount", I_AMT)
+        k2, d2 = greedy("invamt", I_INVAMT)
+        k3, d3 = greedy("balance", I_BAL)
+        k4, d4 = greedy("app_amount", I_APPAMT)
+
+        keys_all = k1.unionByName(k2, True).unionByName(k3, True).unionByName(k4, True)
+        bestw = Window.partitionBy(RID, RCUST).orderBy(F.col("match_diff").asc(), F.col("match_basis").asc())
+        best = keys_all.withColumn("__rn", F.row_number().over(bestw)).where(F.col("__rn") == 1).drop("__rn")
+
+        detail_all = d1.unionByName(d2, True).unionByName(d3, True).unionByName(d4, True)
+        return detail_all.join(best.select(RID, RCUST, "match_basis"), [RID, RCUST, "match_basis"], "inner")
+
+    mk1, det1 = stage1()
+    det2 = stage2(mk1)
+
+    matches = det1.unionByName(det2, True)
+
+    out = (matches.join(r, [RID, RCUST], "inner")
+                 .withColumn("recpt_receipt_date_d", F.to_date(F.col(RDATE)))
+                 .withColumn("inv_invdate_d", F.col("__i_invdt"))
+                 .withColumn("inv_created_ts", F.col("__i_cts"))
+                 .withColumn("inv_modified_ts", F.col("__i_mts"))
+                 .drop("__r_amt", "__r_dt", "__r_ts", "__i_invdt", "__i_cts", "__i_mts", "__i_cd", "__i_md", "__run")
     )
-
-    # prefix all detail columns
-    recpt_d = df_receipts.select(*[F.col(c).alias(f"recpt_{c}") for c in df_receipts.columns])
-    remit_d = df_remittances.select(*[F.col(c).alias(f"remit_{c}") for c in df_remittances.columns])
-
-    out = (recpt_d.alias("recpt")
-        .join(matches_hdr.alias("mch"), F.col(f"recpt.recpt_{receipt_id_col}") == F.col("mch.receipt_id"), "left")
-        .join(remit_d.alias("remit"),
-              (F.col("mch.document_id") == F.col(f"remit.remit_{remit_doc_id_col}")) &
-              (F.col("mch.remitreceipt_id") == F.col(f"remit.remit_{remit_receipt_id_col}")),
-              "left")
-    )
-
-    meta = ["match_rank","match_score","match_pre_score","llm_confidence","matched_amount_field",
-            "amt_diff","day_diff","name_sim","addr_sim","match_explanation"]
-    return out.select(*[F.col(f"mch.{c}") for c in meta],
-                      *[F.col(f"recpt_{c}") for c in df_receipts.columns],
-                      *[F.col(f"remit_{c}") for c in df_remittances.columns])
-                      
-                      
-df_out = match_receipts_to_remittances_detail(
-    df_receipts,
-    df_remittances,
-    AOAI_ENDPOINT=AOAI_ENDPOINT,
-    AOAI_API_VERSION=AOAI_API_VERSION,
-    AOAI_DEPLOYMENT=AOAI_DEPLOYMENT,
-    DRIVER_TOKEN_VALUE=DRIVER_TOKEN_VALUE,
-    amt_tol_pct=0.01,          # ±1%
-    amt_tol_cents_min=0,       # keep 0 for pure %, or set 25 for a 25-cent floor
-    max_matches_per_receipt=3,
-    use_llm=True,
-)
+    return out
 
