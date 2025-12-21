@@ -240,15 +240,13 @@ df_out = match_remit_lines_to_invoices_detail(
     amt_tol_pct=0.01,
     date_window_days=7,
     week_bucket_radius=1,
-    topk_per_remit_line=15,
-    max_matches_per_remit_line=3,
+    topk=15,
+    max_matches=3,
     high_t=0.95,
     secondary_t=0.90,
     margin=0.01,
     use_llm=True,
     llm_partitions=64,
     llm_workers_per_task=8,
-    use_company_prefix_block=True,
-    broadcast_invoices=False,   # try True ONLY if invoice_core is small enough in your cluster
 )
 
