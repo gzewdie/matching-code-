@@ -472,69 +472,294 @@ def fast_sql_match(df_r, df_i, amt_tol_pct=0.01):
     return j.withColumn("diff",F.abs(F.col("sum_amt")-F.col("tgt"))) \
             .orderBy("diff")
 
+from pyspark.sql import functions as F
+
 def fast_sql_match(
     df_receipts,
     df_invoices,
-    amt_tol_pct=0.01,
-    amount_cols=("amount", "balance", "invamt")
+    amt_tol_pct=0.01
 ):
-    # Prepare receipts
-    r = (df_receipts
-         .select("receipt_id","payercust_custno","amount")
-         .withColumn("r_amt_c", F.round(F.col("amount") * 100))
-         )
-
-    # Expand invoices with cents versions
-    i = (df_invoices
-         .select("custno", "inv_row_id",
-                 *[F.round(F.col(c) * 100).alias(f"{c}_c") for c in amount_cols])
+    # ---------------------------
+    # 1. Prepare receipts
+    # ---------------------------
+    r = (
+        df_receipts
+        .select("receipt_id", "payercust_custno", "amount")
+        .filter(
+            F.col("receipt_id").isNotNull() &
+            F.col("payercust_custno").isNotNull() &
+            F.col("amount").isNotNull()
         )
-
-    # Join on custno
-    j = r.join(i, r.payercust_custno == i.custno, "inner") \
-         .select("receipt_id", "r_amt_c", 
-                 *[f"{c}_c" for c in amount_cols])
-
-    # Compute sums per receipt for each amount type
-    agg_exprs = [
-        F.sum(f"{c}_c").alias(f"sum_{c}_c")
-        for c in amount_cols
-    ]
-    grouped = j.groupBy("receipt_id","r_amt_c").agg(*agg_exprs)
-
-    # Best difference among amount / balance / invamt
-    diffs = []
-    for c in amount_cols:
-        diffs.append(F.abs(F.col(f"sum_{c}_c") - F.col("r_amt_c")).alias(f"diff_{c}_c"))
-
-    best = grouped.select(
-        "*",
-        *diffs
-    ).withColumn(
-        "best_diff",
-        F.least(*[F.col(f"diff_{c}_c") for c in amount_cols])
+        .withColumn("r_amt_c", F.round(F.col("amount") * 100).cast("long"))
     )
 
-    # Determine best matched field
-    match_expr = None
-    for c in amount_cols:
-        cond = F.col("best_diff") == F.col(f"diff_{c}_c")
-        if match_expr is None:
-            match_expr = F.when(cond, c)
-        else:
-            match_expr = match_expr.when(cond, c)
-    match_expr = match_expr.otherwise(amount_cols[0])
+    # ---------------------------
+    # 2. Prepare invoices
+    # ---------------------------
+    i = (
+        df_invoices
+        .select("custno", "amount", "balance", "invamt")
+        .filter(F.col("custno").isNotNull())
+        .withColumn("amount_c", F.round(F.col("amount") * 100).cast("long"))
+        .withColumn("balance_c", F.round(F.col("balance") * 100).cast("long"))
+        .withColumn("invamt_c", F.round(F.col("invamt") * 100).cast("long"))
+    )
 
-    out = best.withColumn("matched_field", match_expr) \
-              .withColumn(
-                  "matched_sum_cents",
-                  F.when(F.col("matched_field") == "amount", F.col("sum_amount_c"))
-                   .when(F.col("matched_field") == "balance", F.col("sum_balance_c"))
-                   .otherwise(F.col("sum_invamt_c"))
-              ) \
-              .withColumn("diff_cents", F.col("matched_sum_cents") - F.col("r_amt_c")) \
-              .withColumn("pct_ok", 
-                          F.abs(F.col("diff_cents")) <= (F.col("r_amt_c") * amt_tol_pct)
-              )
+    # ---------------------------
+    # 3. Join on customer number
+    # ---------------------------
+    j = (
+        r.join(i, r.payercust_custno == i.custno, "inner")
+         .select("receipt_id", "r_amt_c", "amount_c", "balance_c", "invamt_c")
+    )
 
-    return out
+    # ---------------------------
+    # 4. Aggregate invoice sums
+    # ---------------------------
+    agg = (
+        j.groupBy("receipt_id", "r_amt_c")
+         .agg(
+             F.sum("amount_c").alias("sum_amount_c"),
+             F.sum("balance_c").alias("sum_balance_c"),
+             F.sum("invamt_c").alias("sum_invamt_c"),
+         )
+    )
+
+    # ---------------------------
+    # 5. Compute diffs
+    # ---------------------------
+    with_diffs = (
+        agg
+        .withColumn("diff_amount_c", F.abs(F.col("sum_amount_c") - F.col("r_amt_c")))
+        .withColumn("diff_balance_c", F.abs(F.col("sum_balance_c") - F.col("r_amt_c")))
+        .withColumn("diff_invamt_c", F.abs(F.col("sum_invamt_c") - F.col("r_amt_c")))
+        .withColumn(
+            "best_diff_c",
+            F.least("diff_amount_c", "diff_balance_c", "diff_invamt_c")
+        )
+    )
+
+    # ---------------------------
+    # 6. Select best matched field
+    # ---------------------------
+    matched_field = (
+        F.when(F.col("best_diff_c") == F.col("diff_amount_c"), F.lit("amount"))
+         .when(F.col("best_diff_c") == F.col("diff_balance_c"), F.lit("balance"))
+         .otherwise(F.lit("invamt"))
+    )
+
+    result = (
+        with_diffs
+        .withColumn("matched_field", matched_field)
+        .withColumn(
+            "matched_sum_cents",
+            F.when(F.col("matched_field") == "amount", F.col("sum_amount_c"))
+             .when(F.col("matched_field") == "balance", F.col("sum_balance_c"))
+             .otherwise(F.col("sum_invamt_c"))
+        )
+        .withColumn(
+            "diff_cents",
+            F.col("matched_sum_cents") - F.col("r_amt_c")
+        )
+        .withColumn(
+            "within_pct_tol",
+            F.abs(F.col("diff_cents")) <= (F.col("r_amt_c") * F.lit(amt_tol_pct))
+        )
+    )
+
+    return result
+
+from pyspark.sql import functions as F
+
+def fast_sql_match(
+    df_receipts,
+    df_invoices,
+    amt_tol_pct=0.01
+):
+    # ---------------------------
+    # 1. Prepare receipts
+    # ---------------------------
+    r = (
+        df_receipts
+        .select("receipt_id", "payercust_custno", "amount")
+        .filter(
+            F.col("receipt_id").isNotNull() &
+            F.col("payercust_custno").isNotNull() &
+            F.col("amount").isNotNull()
+        )
+        .withColumn("r_amt_c", F.round(F.col("amount") * 100).cast("long"))
+    )
+
+    # ---------------------------
+    # 2. Prepare invoices
+    # ---------------------------
+    i = (
+        df_invoices
+        .select("custno", "amount", "balance", "invamt")
+        .filter(F.col("custno").isNotNull())
+        .withColumn("amount_c", F.round(F.col("amount") * 100).cast("long"))
+        .withColumn("balance_c", F.round(F.col("balance") * 100).cast("long"))
+        .withColumn("invamt_c", F.round(F.col("invamt") * 100).cast("long"))
+    )
+
+    # ---------------------------
+    # 3. Join on customer number
+    # ---------------------------
+    j = (
+        r.join(i, r.payercust_custno == i.custno, "inner")
+         .select("receipt_id", "r_amt_c", "amount_c", "balance_c", "invamt_c")
+    )
+
+    # ---------------------------
+    # 4. Aggregate invoice sums
+    # ---------------------------
+    agg = (
+        j.groupBy("receipt_id", "r_amt_c")
+         .agg(
+             F.sum("amount_c").alias("sum_amount_c"),
+             F.sum("balance_c").alias("sum_balance_c"),
+             F.sum("invamt_c").alias("sum_invamt_c"),
+         )
+    )
+
+    # ---------------------------
+    # 5. Compute diffs
+    # ---------------------------
+    with_diffs = (
+        agg
+        .withColumn("diff_amount_c", F.abs(F.col("sum_amount_c") - F.col("r_amt_c")))
+        .withColumn("diff_balance_c", F.abs(F.col("sum_balance_c") - F.col("r_amt_c")))
+        .withColumn("diff_invamt_c", F.abs(F.col("sum_invamt_c") - F.col("r_amt_c")))
+        .withColumn(
+            "best_diff_c",
+            F.least("diff_amount_c", "diff_balance_c", "diff_invamt_c")
+        )
+    )
+
+    # ---------------------------
+    # 6. Select best matched field
+    # ---------------------------
+    matched_field = (
+        F.when(F.col("best_diff_c") == F.col("diff_amount_c"), F.lit("amount"))
+         .when(F.col("best_diff_c") == F.col("diff_balance_c"), F.lit("balance"))
+         .otherwise(F.lit("invamt"))
+    )
+
+    result = (
+        with_diffs
+        .withColumn("matched_field", matched_field)
+        .withColumn(
+            "matched_sum_cents",
+            F.when(F.col("matched_field") == "amount", F.col("sum_amount_c"))
+             .when(F.col("matched_field") == "balance", F.col("sum_balance_c"))
+             .otherwise(F.col("sum_invamt_c"))
+        )
+        .withColumn(
+            "diff_cents",
+            F.col("matched_sum_cents") - F.col("r_amt_c")
+        )
+        .withColumn(
+            "within_pct_tol",
+            F.abs(F.col("diff_cents")) <= (F.col("r_amt_c") * F.lit(amt_tol_pct))
+        )
+    )
+
+    return result
+
+from pyspark.sql import functions as F
+
+def fast_sql_match(
+    df_receipts,
+    df_invoices,
+    amt_tol_pct=0.01
+):
+    # ---------------------------
+    # 1. Prepare receipts
+    # ---------------------------
+    r = (
+        df_receipts
+        .select("receipt_id", "payercust_custno", "amount")
+        .filter(
+            F.col("receipt_id").isNotNull() &
+            F.col("payercust_custno").isNotNull() &
+            F.col("amount").isNotNull()
+        )
+        .withColumn("r_amt_c", F.round(F.col("amount") * 100).cast("long"))
+    )
+
+    # ---------------------------
+    # 2. Prepare invoices
+    # ---------------------------
+    i = (
+        df_invoices
+        .select("custno", "amount", "balance", "invamt")
+        .filter(F.col("custno").isNotNull())
+        .withColumn("amount_c", F.round(F.col("amount") * 100).cast("long"))
+        .withColumn("balance_c", F.round(F.col("balance") * 100).cast("long"))
+        .withColumn("invamt_c", F.round(F.col("invamt") * 100).cast("long"))
+    )
+
+    # ---------------------------
+    # 3. Join on customer number
+    # ---------------------------
+    j = (
+        r.join(i, r.payercust_custno == i.custno, "inner")
+         .select("receipt_id", "r_amt_c", "amount_c", "balance_c", "invamt_c")
+    )
+
+    # ---------------------------
+    # 4. Aggregate invoice sums
+    # ---------------------------
+    agg = (
+        j.groupBy("receipt_id", "r_amt_c")
+         .agg(
+             F.sum("amount_c").alias("sum_amount_c"),
+             F.sum("balance_c").alias("sum_balance_c"),
+             F.sum("invamt_c").alias("sum_invamt_c"),
+         )
+    )
+
+    # ---------------------------
+    # 5. Compute diffs
+    # ---------------------------
+    with_diffs = (
+        agg
+        .withColumn("diff_amount_c", F.abs(F.col("sum_amount_c") - F.col("r_amt_c")))
+        .withColumn("diff_balance_c", F.abs(F.col("sum_balance_c") - F.col("r_amt_c")))
+        .withColumn("diff_invamt_c", F.abs(F.col("sum_invamt_c") - F.col("r_amt_c")))
+        .withColumn(
+            "best_diff_c",
+            F.least("diff_amount_c", "diff_balance_c", "diff_invamt_c")
+        )
+    )
+
+    # ---------------------------
+    # 6. Select best matched field
+    # ---------------------------
+    matched_field = (
+        F.when(F.col("best_diff_c") == F.col("diff_amount_c"), F.lit("amount"))
+         .when(F.col("best_diff_c") == F.col("diff_balance_c"), F.lit("balance"))
+         .otherwise(F.lit("invamt"))
+    )
+
+    result = (
+        with_diffs
+        .withColumn("matched_field", matched_field)
+        .withColumn(
+            "matched_sum_cents",
+            F.when(F.col("matched_field") == "amount", F.col("sum_amount_c"))
+             .when(F.col("matched_field") == "balance", F.col("sum_balance_c"))
+             .otherwise(F.col("sum_invamt_c"))
+        )
+        .withColumn(
+            "diff_cents",
+            F.col("matched_sum_cents") - F.col("r_amt_c")
+        )
+        .withColumn(
+            "within_pct_tol",
+            F.abs(F.col("diff_cents")) <= (F.col("r_amt_c") * F.lit(amt_tol_pct))
+        )
+    )
+
+    return result
+
